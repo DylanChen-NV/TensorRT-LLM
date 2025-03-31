@@ -229,12 +229,14 @@ public:
         EnqueueGenerationParams<T> const& generationsParams, bool forConfigurePlugin);
 
     template <typename T>
-    int ulyssesContextPreprocess(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
-        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, cudaStream_t stream);
+    int ulyssesContextCP2TP(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
+        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
+        cudaStream_t stream);
 
     template <typename T>
-    int ulyssesContextPostprocess(T* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
-        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, cudaStream_t stream);
+    int ulyssesContextTP2CP(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
+        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
+        cudaStream_t stream);
 
     template <typename T>
     int ulyssesGenerationPreprocess(T const* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
@@ -384,7 +386,7 @@ public:
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
-    std::set<int32_t> mCpGroup = {};
+    std::set<int32_t> mCommGroup = {};
     // These parameters are used to specifically configure the attention attributes when cp/tp_size are different
     // between Attention and FFN(such as Ulysses)
     int mNumAttnHeads = -1;
@@ -424,7 +426,7 @@ public:
             mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
             mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
-            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
+            mCpSize, mCpRank, mCommGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
             mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
             mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
     };
@@ -448,7 +450,7 @@ private:
     UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 
 #if ENABLE_MULTI_DEVICE
-    std::shared_ptr<ncclComm_t> mCpNcclComm;
+    std::shared_ptr<ncclComm_t> mNcclComm;
 #endif // ENABLE_MULTI_DEVICE
 
     struct Deleter

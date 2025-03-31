@@ -59,6 +59,8 @@ class _ParallelConfig:
     moe_cluster_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
+    attn_tp_size: int = -1
+    attn_cp_size: int = -1
     cp_config: dict = field(default_factory=dict)
     enable_attention_dp: bool = False
     auto_parallel: bool = False
@@ -127,6 +129,8 @@ class _ParallelConfig:
                        moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
                        moe_ep_size=self.moe_ep_size,
+                       attn_tp_size=self.attn_tp_size,
+                       attn_cp_size=self.attn_cp_size,
                        auto_parallel=self.auto_parallel)
 
 
@@ -760,6 +764,12 @@ class LlmArgs(BaseModel):
         default=None,
         description="The tensor parallel size for MoE models's expert weights.")
 
+    attention_tensor_parallel_size: Optional[int] = -1
+
+    attention_context_parallel_size: Optional[int] = -1
+
+    enable_attention_dp: bool = False
+
     moe_expert_parallel_size: Optional[int] = Field(
         default=None,
         description="The expert parallel size for MoE models's expert weights.")
@@ -981,6 +991,8 @@ class LlmArgs(BaseModel):
             moe_cluster_size=self.moe_cluster_parallel_size,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
+            attn_tp_size=self.attention_tensor_parallel_size,
+            attn_cp_size=self.attention_context_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
             cp_config=self.cp_config,
             auto_parallel=self.auto_parallel)
@@ -1257,7 +1269,9 @@ class LlmArgs(BaseModel):
             gpus_per_node=mapping.gpus_per_node,
             moe_cluster_size=mapping.moe_cluster_size,
             moe_tp_size=mapping.moe_tp_size,
-            moe_ep_size=mapping.moe_ep_size)
+            moe_ep_size=mapping.moe_ep_size,
+            attn_tp_size=mapping.attn_tp_size,
+            attn_cp_size=mapping.attn_cp_size)
 
     def _load_config_from_ckpt(self, ckpt_dir: Path):
         pretrained_config = PretrainedConfig.from_json_file(ckpt_dir /
@@ -1268,6 +1282,8 @@ class LlmArgs(BaseModel):
         moe_cluster_size = pretrained_config.mapping.moe_cluster_size
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
+        attn_tp_size = pretrained_config.mapping.attn_tp_size
+        attn_ep_size = pretrained_config.mapping.attn_ep_size
         world_size = pretrained_config.mapping.world_size
         gpus_per_node = pretrained_config.mapping.gpus_per_node
         # load parallel_config
@@ -1296,7 +1312,9 @@ class LlmArgs(BaseModel):
                 gpus_per_node=gpus_per_node,
                 moe_cluster_size=moe_cluster_size,
                 moe_tp_size=moe_tp_size,
-                moe_ep_size=moe_ep_size)
+                moe_ep_size=moe_ep_size,
+                attn_tp_size=attn_tp_size,
+                attn_ep_size=attn_ep_size)
 
     def _setup_embedding_parallel_mode(self):
         if self.embedding_parallel_mode == 'NONE':

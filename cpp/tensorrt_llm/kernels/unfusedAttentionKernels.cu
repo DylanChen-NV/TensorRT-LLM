@@ -2139,7 +2139,8 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
 
 template <typename T>
 __global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, int64_t cpSize,
-    int64_t partialQHeads, int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank)
+    int64_t partialQHeads, int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSizeQ, int64_t headSizeK,
+    int64_t headSizeV, int64_t rank)
 {
     // Do transpose from
     // [partialTokenNum, mNumHeads + 2*mNumKVHeads, headSize]
@@ -2147,41 +2148,53 @@ __global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTok
     // -> (transpose) [cpSize, partialTokenNum, partialQHeads + partialKvHeads + partialKVHeads, headSize]
     using VecType = int4;
     static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
-    int64_t hiddenSize = static_cast<int64_t>(headSize / kStep);
-    int64_t hiddenRestSize = static_cast<int64_t>(headSize % kStep);
-
-    if (threadIdx.x >= hiddenSize + hiddenRestSize)
-        return;
-
     int64_t seqIdx = blockIdx.x;
     int64_t cpIdx = blockIdx.y;
     int64_t headIdx = blockIdx.z;
 
-    auto srcHeadIdx = 0;
+    int64_t srcHeadIdx = 0;
+    int64_t headPrefix = 0;
+    int64_t hiddenSize = 0;
+    int64_t hiddenRestSize = 0;
     if (headIdx < partialQHeads)
     {
-        srcHeadIdx = cpIdx * partialQHeads + headIdx;
+        srcHeadIdx = (cpIdx * partialQHeads + headIdx) * headSizeQ;
+        headPrefix = headIdx * headSizeQ;
+        hiddenSize = static_cast<int64_t>(headSizeQ / kStep);
+        hiddenRestSize = static_cast<int64_t>(headSizeQ % kStep);
     }
     else if (headIdx < partialQHeads + partialKVHeads)
     {
-        srcHeadIdx = cpSize * partialQHeads + cpIdx / mqaBroadcast * partialKVHeads + (headIdx - partialQHeads);
+        srcHeadIdx = cpSize * partialQHeads * headSizeQ
+            + (cpIdx / mqaBroadcast * partialKVHeads + (headIdx - partialQHeads)) * headSizeK;
+        headPrefix = partialQHeads * headSizeQ + (headIdx - partialQHeads) * headSizeK;
+        hiddenSize = static_cast<int64_t>(headSizeK / kStep);
+        hiddenRestSize = static_cast<int64_t>(headSizeK % kStep);
     }
     else
     {
-        srcHeadIdx = cpSize * partialQHeads + cpSize / mqaBroadcast * partialKVHeads
-            + cpIdx / mqaBroadcast * partialKVHeads + (headIdx - partialQHeads - partialKVHeads);
+        srcHeadIdx = cpSize * partialQHeads * headSizeQ + cpSize / mqaBroadcast * partialKVHeads * headSizeK
+            + (cpIdx / mqaBroadcast * partialKVHeads + (headIdx - partialQHeads - partialKVHeads)) * headSizeV;
+        headPrefix = partialQHeads * headSizeQ + partialKVHeads * headSizeK
+            + (headIdx - partialQHeads - partialKVHeads) * headSizeV;
+        hiddenSize = static_cast<int64_t>(headSizeV / kStep);
+        hiddenRestSize = static_cast<int64_t>(headSizeV % kStep);
     }
+
+    if (threadIdx.x >= hiddenSize + hiddenRestSize)
+        return;
 
     if (cpIdx == rank)
     {
         dst = dst2;
     }
-    VecType* out = reinterpret_cast<VecType*>(dst
-        + (cpIdx * partialTokenNum * (partialQHeads + 2 * partialKVHeads)
-              + seqIdx * (partialQHeads + 2 * partialKVHeads) + headIdx)
-            * headSize);
-    VecType const* in = reinterpret_cast<VecType const*>(
-        src + (seqIdx * (partialQHeads * cpSize + 2 * partialKVHeads * cpSize / mqaBroadcast) + srcHeadIdx) * headSize);
+    int64_t hiddenAllSize = partialQHeads * headSizeQ + partialKVHeads * headSizeK + partialKVHeads * headSizeV;
+    VecType* out = reinterpret_cast<VecType*>(
+        dst + cpIdx * partialTokenNum * hiddenAllSize + seqIdx * hiddenAllSize + headPrefix);
+    VecType const* in = reinterpret_cast<VecType const*>(src
+        + seqIdx
+            * (partialQHeads * headSizeQ * cpSize + partialKVHeads * (headSizeK + headSizeV) * cpSize / mqaBroadcast)
+        + srcHeadIdx);
 
     for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
     {
@@ -2195,7 +2208,7 @@ __global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTok
 
 template <typename T>
 __global__ void runCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
-    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank)
+    int64_t cpSize, int64_t newPartialHiddenSize, int64_t rank)
 {
     // Do transpose from
     // [totalLength, mNumHeads / cp, Dh]
@@ -2203,8 +2216,8 @@ __global__ void runCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* sr
     // -> (transpose) [partialLength, mNumHeads, Dh]
     using VecType = int4;
     static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
-    int64_t hiddenSize = static_cast<int64_t>(headSize * newPartialHeads / kStep);
-    int64_t hiddenRestSize = static_cast<int64_t>(headSize * newPartialHeads % kStep);
+    int64_t hiddenSize = static_cast<int64_t>(newPartialHiddenSize / kStep);
+    int64_t hiddenRestSize = static_cast<int64_t>(newPartialHiddenSize % kStep);
 
     if (threadIdx.x >= hiddenSize + hiddenRestSize)
         return;
@@ -2220,9 +2233,8 @@ __global__ void runCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* sr
     {
         src = srcOtherRank;
     }
-    VecType const* in
-        = reinterpret_cast<VecType const*>(src + (cpIdx * partialLength + seqIdx) * headSize * newPartialHeads);
-    VecType* out = reinterpret_cast<VecType*>(dst + (seqIdx * cpSize + cpIdx) * headSize * newPartialHeads);
+    VecType const* in = reinterpret_cast<VecType const*>(src + (cpIdx * partialLength + seqIdx) * newPartialHiddenSize);
+    VecType* out = reinterpret_cast<VecType*>(dst + (seqIdx * cpSize + cpIdx) * newPartialHiddenSize);
     for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
     {
         if (hiddenIdx < hiddenSize)
@@ -2236,7 +2248,7 @@ __global__ void runCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* sr
 template <typename T>
 __global__ void runCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
     int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
-    int64_t partialHeads, int64_t headSize)
+    int64_t partialHiddenSize)
 {
     // Do transpose from
     // [cpSize_Length, bs, partialLength, partialHead, headSize]
@@ -2244,8 +2256,8 @@ __global__ void runCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengt
     // paddings of partial length are removed here
     using VecType = int4;
     static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
-    int64_t hiddenSize = static_cast<int64_t>(headSize * partialHeads / kStep);
-    int64_t hiddenRestSize = static_cast<int64_t>(headSize * partialHeads % kStep);
+    int64_t hiddenSize = static_cast<int64_t>(partialHiddenSize / kStep);
+    int64_t hiddenRestSize = static_cast<int64_t>(partialHiddenSize % kStep);
 
     if (threadIdx.x >= hiddenSize + hiddenRestSize)
         return;
@@ -2265,10 +2277,9 @@ __global__ void runCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengt
     for (int partialTokenIdx = tokenIdx; partialTokenIdx < partialLength; partialTokenIdx += maxPartalLength)
     {
 
-        VecType* out
-            = reinterpret_cast<VecType*>(dst + (partialLengthOutIdx + partialTokenIdx) * partialHeads * headSize);
+        VecType* out = reinterpret_cast<VecType*>(dst + (partialLengthOutIdx + partialTokenIdx) * partialHiddenSize);
         VecType const* in
-            = reinterpret_cast<VecType const*>(src + (partialLengthInIdx + partialTokenIdx) * partialHeads * headSize);
+            = reinterpret_cast<VecType const*>(src + (partialLengthInIdx + partialTokenIdx) * partialHiddenSize);
         for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
         {
             if (hiddenIdx < hiddenSize)
@@ -2281,47 +2292,104 @@ __global__ void runCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengt
 }
 
 template <typename T>
-__global__ void runCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths,
+__global__ void runCpTransposeToSeqMajor2(T* dstMyRank, T* dstOtherRank, T const* src, int32_t const* q_seq_lengths,
     int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,
-    int64_t batchSize, int64_t partialHeads, int64_t headSize)
+    int64_t batchSize, int64_t hiddenSize, int64_t rank)
 {
+    // using VecType = float4;
+    //     VecType* out = reinterpret_cast<VecType*>(dst);
+    //     VecType const* in = reinterpret_cast<VecType const*>(src);
+    //     for (int i = 0; i < 1; ++i)
+    //     {
+    //         // dst[i] = src[i]; // ok
+    //         auto temp = in[i];
+    //         out[i] = temp;
+    //     }
+    //     return;
+
+    // TODO: fix comments ?
     // Do transpose from
     // [tokens(bs, cp, paritalLength), partialHeads, headSize]
     // -> (transpose) [cp, partialTokens(bs, partialLength), partialHeads, headSize]
     // paddings of partial length are added here
     using VecType = int4;
     static constexpr int32_t kStep = static_cast<int32_t>(sizeof(VecType) / sizeof(T));
-    int64_t hiddenSize = static_cast<int64_t>(headSize * partialHeads / kStep);
-    int64_t hiddenRestSize = static_cast<int64_t>(headSize * partialHeads % kStep);
+    int64_t vecNum = static_cast<int64_t>(hiddenSize / kStep);
+    int64_t restNum = static_cast<int64_t>(hiddenSize % kStep);
 
-    if (threadIdx.x >= hiddenSize + hiddenRestSize)
+    if (threadIdx.x >= vecNum + restNum)
         return;
 
     int64_t cpIdx = blockIdx.x;
     int64_t tokenIdx = blockIdx.y;
     int64_t seqIdx = blockIdx.z;
+    T* dst = cpIdx == rank ? dstMyRank : dstOtherRank;
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+    // {
+    //     printf("czq runCpTransposeToSeqMajor2 q_seq_lengths %d %d %d, cu_q_seqlens %d %d %d, cu_cp_partial_seqlens %d
+    //     %d %d\n",
+    //         q_seq_lengths[0], q_seq_lengths[1], q_seq_lengths[2],
+    //         cu_q_seqlens[0], cu_q_seqlens[1], cu_q_seqlens[2],
+    //         cu_cp_partial_seqlens[0], cu_cp_partial_seqlens[1], cu_cp_partial_seqlens[2]);
+    // }
+    // cid=1 sid=0
     int64_t length = q_seq_lengths[seqIdx];
+    // 2
     int64_t partialLength = (length + cpSize - 1) / cpSize;
-    int64_t partialLengthOutIdx = cu_q_seqlens[seqIdx] + partialLength * cpIdx;                            // cpMajor
-    int64_t partialLengthInIdx = cu_cp_partial_seqlens[batchSize] * cpIdx + cu_cp_partial_seqlens[seqIdx]; // bsMajor
+    // 0 + 2 * 1
+    int64_t partialLengthInIdx = cu_q_seqlens[seqIdx] + partialLength * cpIdx; // cpMajor
+    // 5 * 1 + 0
+    int64_t partialLengthOutIdx = cu_cp_partial_seqlens[batchSize] * cpIdx + cu_cp_partial_seqlens[seqIdx]; // bsMajor
+    // q_seq_lengths 4 5 0, cu_q_seqlens 0 4 9, cu_cp_partial_seqlens 0 2 5
     if (cpIdx + 1 == cpSize)
     {
         partialLength = length - partialLength * (cpSize - 1);
     }
+    // if (threadIdx.x == 0)
+    // {
+    //     printf("czqtgt2 cid%d,tid%d,sid%d partialLengthOutIdx %d, partialLengthInIdx %d, outMax %d, inMax %d\n",
+    //         int(cpIdx), int(tokenIdx), int(seqIdx), int(partialLengthOutIdx), int(partialLengthInIdx),
+    //         int(partialLengthOutIdx + partialLength) * hiddenSize, int(partialLengthInIdx + partialLength) *
+    //         hiddenSize);
+    // }
     for (int partialTokenIdx = tokenIdx; partialTokenIdx < partialLength; partialTokenIdx += maxPartalLength)
     {
-        VecType* out
-            = reinterpret_cast<VecType*>(dst + (partialLengthInIdx + partialTokenIdx) * partialHeads * headSize);
-        VecType const* in
-            = reinterpret_cast<VecType const*>(src + (partialLengthOutIdx + partialTokenIdx) * partialHeads * headSize);
-        for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
+        VecType* out = reinterpret_cast<VecType*>(dst + (partialLengthOutIdx + partialTokenIdx) * hiddenSize);
+        // = reinterpret_cast<VecType*>(dst);
+        VecType const* in = reinterpret_cast<VecType const*>(src + (partialLengthInIdx + partialTokenIdx) * hiddenSize);
+        // = reinterpret_cast<VecType const*>(src);
+        // for (int i = 0; i < 8; ++i)
+        // {
+        //     // dst[i] = src[i]; // ok
+        //     // out[i] = in[i]; // ok
+        // }
+        for (int hiddenIdx = threadIdx.x; hiddenIdx < vecNum + restNum; hiddenIdx += blockDim.x)
         {
-            if (hiddenIdx < hiddenSize)
-                out[hiddenIdx] = in[hiddenIdx];
+            // out[0] = in[0];
+
+            if (hiddenIdx < vecNum)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    reinterpret_cast<T*>(out)[hiddenIdx * 8 + i] = reinterpret_cast<T const*>(in)[hiddenIdx * 8 + i];
+                }
+            }
             else
-                reinterpret_cast<T*>(out + hiddenSize)[hiddenIdx - hiddenSize]
-                    = reinterpret_cast<T const*>(in + hiddenSize)[hiddenIdx - hiddenSize];
+            {
+                reinterpret_cast<T*>(out + vecNum)[hiddenIdx - vecNum]
+                    = reinterpret_cast<T const*>(in + vecNum)[hiddenIdx - vecNum];
+            }
+
+            // if (hiddenIdx < vecNum)
+            //     out[hiddenIdx] = in[hiddenIdx];
+            // else
+            //     reinterpret_cast<T*>(out + vecNum)[hiddenIdx - vecNum]
+            //         = reinterpret_cast<T const*>(in + vecNum)[hiddenIdx - vecNum];
         }
+        // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+        // {
+        //     printf("czq out %p, %d, in %p, %d\n", dst, float(dst[0]), src, float(src[0]));
+        // }
     }
 }
 
@@ -2347,18 +2415,19 @@ INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
 
 template <typename T>
 void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, int64_t cpSize, int64_t partialQHeads,
-    int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank, cudaStream_t stream)
+    int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSizeQ, int64_t headSizeK, int64_t headSizeV, int64_t rank,
+    cudaStream_t stream)
 {
     dim3 grid(partialTokenNum, cpSize, partialQHeads + 2 * partialKVHeads);
     dim3 block(128);
-    runCpTranspose<T><<<grid, block, 0, stream>>>(
-        dst, dst2, src, partialTokenNum, cpSize, partialQHeads, partialKVHeads, mqaBroadcast, headSize, rank);
+    runCpTranspose<T><<<grid, block, 0, stream>>>(dst, dst2, src, partialTokenNum, cpSize, partialQHeads,
+        partialKVHeads, mqaBroadcast, headSizeQ, headSizeK, headSizeV, rank);
 }
 
 #define INSTANTIATE_invokeCpTranspose(T)                                                                               \
     template void invokeCpTranspose<T>(T * dst, T * dst2, T const* src, int64_t partialLength, int64_t cpSize,         \
-        int64_t partialQHeads, int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank,           \
-        cudaStream_t stream)
+        int64_t partialQHeads, int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSizeQ, int64_t headSizeK,     \
+        int64_t headSizeV, int64_t rank, cudaStream_t stream)
 INSTANTIATE_invokeCpTranspose(float);
 INSTANTIATE_invokeCpTranspose(half);
 INSTANTIATE_invokeCpTranspose(__nv_bfloat16);
@@ -2366,18 +2435,17 @@ INSTANTIATE_invokeCpTranspose(__nv_bfloat16);
 
 template <typename T>
 void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
-    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank, cudaStream_t stream)
+    int64_t cpSize, int64_t newPartialHiddenSize, int64_t rank, cudaStream_t stream)
 {
     dim3 grid(cpSize, partialLength);
     dim3 block(128);
-    runCpTransposeToSeqMajor<T><<<grid, block, 0, stream>>>(
-        dst, srcMyRank, srcOtherRank, partialLength, cpSize, newPartialHeads, headSize, rank);
+    runCpTransposeToSeqMajor<T>
+        <<<grid, block, 0, stream>>>(dst, srcMyRank, srcOtherRank, partialLength, cpSize, newPartialHiddenSize, rank);
 }
 
 #define INSTANTIATE_invokeCpTransposeToSeqMajor(T)                                                                     \
     template void invokeCpTransposeToSeqMajor<T>(T * dst, T const* srcMyRank, T const* srcOtherRank,                   \
-        int64_t partialLength, int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank,                \
-        cudaStream_t stream)
+        int64_t partialLength, int64_t cpSize, int64_t newPartialHiddenSize, int64_t rank, cudaStream_t stream)
 INSTANTIATE_invokeCpTransposeToSeqMajor(float);
 INSTANTIATE_invokeCpTransposeToSeqMajor(half);
 INSTANTIATE_invokeCpTransposeToSeqMajor(__nv_bfloat16);
@@ -2387,40 +2455,44 @@ INSTANTIATE_invokeCpTransposeToSeqMajor(__nv_fp8_e4m3);
 template <typename T>
 void invokeCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
     int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
-    int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+    int64_t partialHiddenSize, cudaStream_t stream)
 {
     int64_t clipedMaxPartialLength = min(static_cast<int>(maxPartalLength), 512);
     dim3 grid(cpSize, clipedMaxPartialLength, batchSize);
     dim3 block(128);
     runCpTranspose2<T><<<grid, block, 0, stream>>>(dst, src, q_seq_lengths, cu_q_seqlens, cu_cp_partial_seqlens, cpSize,
-        clipedMaxPartialLength, batchSize, partialHeads, headSize);
+        clipedMaxPartialLength, batchSize, partialHiddenSize);
 }
 
 #define INSTANTIATE_invokeCpTranspose2(T)                                                                              \
     template void invokeCpTranspose2<T>(T * dst, T const* src, int32_t const* q_seq_lengths,                           \
         int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,    \
-        int64_t batchSize, int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+        int64_t batchSize, int64_t partialHiddenSize, cudaStream_t stream)
 INSTANTIATE_invokeCpTranspose2(float);
 INSTANTIATE_invokeCpTranspose2(half);
 INSTANTIATE_invokeCpTranspose2(__nv_bfloat16);
 #undef INSTANTIATE_invokeCpTranspose2
 
 template <typename T>
-void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
-    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
-    int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+void invokeCpTransposeToSeqMajor2(T* dstMyRank, T* dstOtherRank, T const* src, int32_t const* q_seq_lengths,
+    int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,
+    int64_t batchSize, int64_t hiddenSize, int64_t rank, cudaStream_t stream)
 {
+    // max blocks for PartialLength
     int64_t clipedMaxPartialLength = min(static_cast<int>(maxPartalLength), 512);
     dim3 grid(cpSize, clipedMaxPartialLength, batchSize);
     dim3 block(128);
-    runCpTransposeToSeqMajor2<T><<<grid, block, 0, stream>>>(dst, src, q_seq_lengths, cu_q_seqlens,
-        cu_cp_partial_seqlens, cpSize, clipedMaxPartialLength, batchSize, partialHeads, headSize);
+    // printf("czq check bs %d, cpSize %d, maxPartialLength %d, hiddenSize %d\n",
+    //     batchSize, cpSize, maxPartalLength, hiddenSize);
+    runCpTransposeToSeqMajor2<T><<<grid, block, 0, stream>>>(dstMyRank, dstOtherRank, src, q_seq_lengths, cu_q_seqlens,
+        cu_cp_partial_seqlens, cpSize, clipedMaxPartialLength, batchSize, hiddenSize, rank);
 }
 
 #define INSTANTIATE_invokeCpTransposeToSeqMajor2(T)                                                                    \
-    template void invokeCpTransposeToSeqMajor2<T>(T * dst, T const* src, int32_t const* q_seq_lengths,                 \
-        int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,    \
-        int64_t batchSize, int64_t partialHeads, int64_t headSize, cudaStream_t stream)
+    template void invokeCpTransposeToSeqMajor2<T>(T * dstMyRank, T * dstOtherRank, T const* src,                       \
+        int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens,               \
+        int64_t cpSize, int64_t maxPartalLength, int64_t batchSize, int64_t hiddenSize, int64_t rank,                  \
+        cudaStream_t stream)
 INSTANTIATE_invokeCpTransposeToSeqMajor2(float);
 INSTANTIATE_invokeCpTransposeToSeqMajor2(half);
 INSTANTIATE_invokeCpTransposeToSeqMajor2(__nv_bfloat16);

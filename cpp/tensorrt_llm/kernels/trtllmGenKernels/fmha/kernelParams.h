@@ -579,23 +579,23 @@ struct KernelParams
             /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
             /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-        if (result != CUDA_SUCCESS)
+        if (true || result != CUDA_SUCCESS)
         {
             char const* err_str;
             cuGetErrorString(result, &err_str);
-            std::cerr << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
-            std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
+            std::cout << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
+            std::cout << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
                       << std::endl;
-            std::cerr << "Shape: " << shapes[0] << " " << shapes[1] << " " << shapes[2] << " " << shapes[3] << " "
+            std::cout << "Shape: " << shapes[0] << " " << shapes[1] << " " << shapes[2] << " " << shapes[3] << " "
                       << shapes[4] << std::endl;
-            std::cerr << "Stride: " << stridesInBytes[0] << " " << stridesInBytes[1] << " " << stridesInBytes[2] << " "
+            std::cout << "Stride: " << stridesInBytes[0] << " " << stridesInBytes[1] << " " << stridesInBytes[2] << " "
                       << stridesInBytes[3] << std::endl;
-            std::cerr << "tileShapes: " << tileShapes[0] << " " << tileShapes[1] << " " << tileShapes[2] << " "
+            std::cout << "tileShapes: " << tileShapes[0] << " " << tileShapes[1] << " " << tileShapes[2] << " "
                       << tileShapes[3] << " " << tileShapes[4] << std::endl;
-            std::cerr << "tileStrides: " << tileStrides[0] << " " << tileStrides[1] << " " << tileStrides[2] << " "
+            std::cout << "tileStrides: " << tileStrides[0] << " " << tileStrides[1] << " " << tileStrides[2] << " "
                       << tileStrides[3] << " " << tileStrides[4] << std::endl;
-            std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
-            TLLM_CHECK(false);
+            std::cout << "swizzleType: " << int(swizzleType) << std::endl;
+            // TLLM_CHECK(false);
         }
 
         return desc;
@@ -633,9 +633,11 @@ struct KernelParams
         // Shape/stride for gmem tensor Q.
         auto [shapeQ, strideQ, tileShapeQ]
             = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+        TLLM_LOG_ERROR("czq shapeQ(%p): %d, strideQ: %d, tileShapeQ: %d", qPtr, shapeQ[0], strideQ[0], tileShapeQ[0]);
         // Build tma descriptor for Q.
         params.tmaQ_ = buildNdTmaDescriptor(
             options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
+        TLLM_LOG_ERROR("czq end3");
 
         // The number of keys per tile.
         int32_t numKeysPerTile = isPagedKv(options.mQkvLayout)
@@ -659,13 +661,16 @@ struct KernelParams
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
         // Build tma descriptor for K.
+        TLLM_LOG_ERROR("czq shapeK: %d, strideK: %d, tileShapeK: %d", shapeK[0], strideK[0], tileShapeKv[0]);
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
             /*swizzled = */ !transformsKv);
         // Build tma descriptor for V.
+        TLLM_LOG_ERROR("czq shapeV: %d, strideV: %d, tileShapeV: %d", shapeV[0], strideV[0], tileShapeKv[0]);
         params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv,
             const_cast<void*>(vPtr),
             /*swizzled = */ !transformsKv);
+        TLLM_LOG_ERROR("czq end");
 
         // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
         if (kernelMeta.mDataTypeKv == DATA_TYPE_E2M1)
@@ -701,8 +706,10 @@ struct KernelParams
         tileShapeO[0] = numEltsInClampedHeadDimQ;
         tileShapeO[1] = kernelMeta.mTileSizeQ;
         // Build tma descriptor for O.
+        TLLM_LOG_ERROR("czq shapeO: %d, strideO: %d, tileShapeO: %d", shapeO[0], strideO[0], tileShapeO[0]);
         params.tmaO_ = buildNdTmaDescriptor(
             options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO, const_cast<void*>(options.oPtr));
+        TLLM_LOG_ERROR("czq end2");
 
         // Set the other kernel parameters.
         params.ptrCumSeqLensQ = options.cumSeqLensQPtr;

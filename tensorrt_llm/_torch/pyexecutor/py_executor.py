@@ -292,6 +292,7 @@ class PyExecutor:
         """
         req_ids = []
         try:
+            # import time;time.sleep(2)
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()

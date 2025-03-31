@@ -99,7 +99,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     mMLAParams = {q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
     mCpSize = cp_size;
     mCpRank = cp_rank;
-    mCpGroup = std::move(cp_group);
+    mCommGroup = std::move(cp_group);
     mFuseFp4Quant = fuse_fp4_quant;
     mSkipAttn = skip_attn;
 }
@@ -174,12 +174,12 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
         DecoderXQARunner::Resource(d, decoderXQARunnerResourceSerializedSize), /*initialize=*/true);
     d += decoderXQARunnerResourceSerializedSize;
 
-    mCpGroup.clear();
+    mCommGroup.clear();
     int32_t groupItem = 0;
     while (d != a + length)
     {
         read(d, groupItem);
-        mCpGroup.insert(groupItem);
+        mCommGroup.insert(groupItem);
     }
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
@@ -218,7 +218,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mSpecDecodingIsGenerationLengthVariable) + sizeof(mSpecDecodingMaxGenerationLength)
         + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mFuseFp4Quant)
         + sizeof(mSkipAttn) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
-        + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size()
+        + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCommGroup.size()
         + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
 }
 
@@ -287,7 +287,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     DecoderXQARunner::getResourceGlobal()->serialize(d, decoderXQARunnerResourceSerializedSize);
     d += decoderXQARunnerResourceSerializedSize;
 
-    for (auto it = mCpGroup.begin(); it != mCpGroup.end(); ++it)
+    for (auto it = mCommGroup.begin(); it != mCommGroup.end(); ++it)
     {
         write(d, *it);
     }

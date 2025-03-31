@@ -154,9 +154,9 @@ class Mapping(object):
         elif attn_cp_size == -1:
             attn_cp_size = cp_size * tp_size // attn_tp_size
 
-        if attn_cp_size != 1:
+        if attn_tp_size != 1 and attn_cp_size != 1:
             raise ValueError(
-                f"attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
+                f"One of attn_tp_size and attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
             )
 
         if auto_parallel:

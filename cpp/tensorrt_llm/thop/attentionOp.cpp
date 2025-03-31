@@ -126,9 +126,26 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin,
         torch::optional<torch::Tensor> mrope_position_deltas) const override
     {
+        // token_offset = 16;
+        // std::cout << "czq qkv" << qkv.to(torch::Device(torch::kCPU)) << std::endl;
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
         AttentionOutT* context_buf = static_cast<AttentionOutT*>(output.slice(0, token_offset).data_ptr());
+        // std::cout << token_offset << attention_input << "czq qkv2" << qkv.slice(0,
+        // token_offset).to(torch::Device(torch::kCPU)) << std::endl;
+        //     {
+        //         const int bufSize = 16;
+        //         const int line = 16;
+        //         std::vector<T> host_buf(bufSize, 0);
+        //         cudaMemcpyAsync(host_buf.data(), attention_input, bufSize * sizeof(T), cudaMemcpyDeviceToHost,
+        //         stream); sync_check_cuda_error(stream); printf("czq attn qkv before input origin %p",
+        //         attention_input); for (int i=0;i<host_buf.size();++i)
+        //         {
+        //             if (i % line == 0) printf("\nline%d:", i / line);
+        //             printf("%f ", float(host_buf[i]));
+        //         }
+        //         printf("end \n");
+        //     }
 
         // Rotary inv_freq, cos_sin cache to avoid re-computing.
         float const* rotary_inv_freq_ptr = nullptr;
@@ -266,6 +283,19 @@ public:
                 enqueue_params.mrope_rotary_cos_sin
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
+            // {
+            //     const int bufSize = 16;
+            //     const int line = 16;
+            //     std::vector<T> host_buf(bufSize, 0);
+            //     cudaMemcpyAsync(host_buf.data(), enqueue_params.attention_input, bufSize * sizeof(T),
+            //     cudaMemcpyDeviceToHost, stream); sync_check_cuda_error(stream); printf("czq attn qkv before2 input
+            //     origin %p", enqueue_params.attention_input); for (int i=0;i<host_buf.size();++i)
+            //     {
+            //         if (i % line == 0) printf("\nline%d:", i / line);
+            //         printf("%f ", float(host_buf[i]));
+            //     }
+            //     printf("end \n");
+            // }
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
         else // generation stage
@@ -335,6 +365,32 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
+struct AttentionUlyssesParams
+{
+    int64_t tp_size;
+    int64_t tp_rank;
+    int64_t cp_size;
+    int64_t cp_rank;
+    int64_t attn_tp_size;
+    int64_t attn_cp_size;
+    std::vector<int64_t> comm_group;
+
+    AttentionUlyssesParams() = default;
+
+    static AttentionUlyssesParams fromDict(c10::Dict<std::string, c10::IValue> const& dict)
+    {
+        AttentionUlyssesParams params;
+        params.tp_size = dict.at("tp_size").toInt();
+        params.tp_rank = dict.at("tp_rank").toInt();
+        params.cp_size = dict.at("cp_size").toInt();
+        params.cp_rank = dict.at("cp_rank").toInt();
+        params.attn_tp_size = dict.at("attn_tp_size").toInt();
+        params.attn_cp_size = dict.at("attn_cp_size").toInt();
+        params.comm_group = dict.at("comm_group").toIntList().vec();
+        return params;
+    }
+};
+
 torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
     std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
@@ -358,7 +414,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     std::optional<int64_t> attention_input_type, bool is_mla_enable, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
-    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas)
+    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+    c10::Dict<std::string, c10::IValue> ulysses_params_dict)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -447,6 +504,14 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
     op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mTpSize = ulysses_params_dict.at("tp_size").toInt();
+    op->mTpRank = ulysses_params_dict.at("tp_rank").toInt();
+    op->mCpSize = ulysses_params_dict.at("cp_size").toInt();
+    op->mCpRank = ulysses_params_dict.at("cp_rank").toInt();
+    op->mAttnTpSize = ulysses_params_dict.at("attn_tp_size").toInt();
+    op->mAttnCpSize = ulysses_params_dict.at("attn_cp_size").toInt();
+    auto const& commGroupVec = ulysses_params_dict.at("comm_group").toIntList().vec();
+    op->mCommGroup = std::set<int>(commGroupVec.begin(), commGroupVec.end());
 
     if (is_mla_enable)
     {
@@ -653,6 +718,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? v_head_dim"
         ", Tensor? mrope_rotary_cos_sin"
         ", Tensor? mrope_position_deltas"
+        ", Dict(str, Any) ulysses_params_dict"
         ") -> Tensor");
 }
 

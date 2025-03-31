@@ -122,6 +122,7 @@ class TrtllmAttentionWrapper:
         self.rotary_embedding_long_m_scale = rope_params.long_m_scale
         self.rotary_embedding_max_positions = rope_params.max_positions
         self.rotary_embedding_original_max_positions = rope_params.original_max_positions
+        self.mapping = kwargs.get('mapping', None)
         self.kwargs = {}
         self.kwargs.update(kwargs)
 
@@ -312,6 +313,27 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
 
+        print("czq before call attention")
+        ulysses_params = {
+            "tp_size":
+            self.mapping.tp_size,
+            "tp_rank":
+            self.mapping.tp_rank,
+            "cp_size":
+            self.mapping.cp_size,
+            "cp_rank":
+            self.mapping.cp_rank,
+            "attn_tp_size":
+            self.mapping.attn_tp_size,
+            "attn_cp_size":
+            self.mapping.attn_cp_size,
+            "comm_group":
+            self.mapping.cp_group if self.mapping.cp_size
+            > self.mapping.attn_cp_size else self.mapping.tp_group,
+        }
+        print("czq ulysses_params", ulysses_params)
+        print("czq tpgroup", self.mapping.tp_group)
+        print("czq in trtllm.py q", q.shape, q[0, :16])
         output = torch.ops.trtllm.attention(
             q,
             k,
@@ -371,6 +393,7 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            ulysses_params,
         )
         return output
 
@@ -604,6 +627,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             pos_embd_params=pos_embd_params,
             q_scaling=q_scaling,
             mla_params=mla_params,
+            mapping=kwargs.get('mapping', None),
         )
 
         self.is_mla_enable = mla_params is not None

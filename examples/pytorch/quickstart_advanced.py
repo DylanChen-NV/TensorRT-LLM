@@ -7,11 +7,15 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig)
 
 example_prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
+    "Hello, my name",
+    "Hello, my name",
+    #"The president of the United States is",
+    #"The capital of France is",
     "The future of AI is",
 ]
+#example_prompts = [
+#    "The future of AI is",
+#]
 
 
 def add_llm_args(parser):
@@ -60,6 +64,8 @@ def add_llm_args(parser):
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
+    parser.add_argument('--attn_tp_size', type=int, default=-1)
+    parser.add_argument('--attn_cp_size', type=int, default=-1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
@@ -159,6 +165,8 @@ def setup_llm(args):
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
               moe_cluster_parallel_size=args.moe_cluster_size,
+              attention_tensor_parallel_size=args.attn_tp_size,
+              attention_context_parallel_size=args.attn_cp_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
               speculative_config=spec_config)
 

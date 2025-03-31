@@ -99,6 +99,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
         self.quant_config = config.get_quant_config()
+        self.mapping_config = config.mapping
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
 
@@ -132,6 +133,7 @@ class Attention(nn.Module):
             if self.enable_rope_fusion else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            mapping=self.mapping_config,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -424,6 +426,7 @@ class MLA(nn.Module):
             v_head_dim=self.v_head_dim,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            mapping=config.mapping,
         )
 
         self.mqa = create_attention(
@@ -443,6 +446,7 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            mapping=config.mapping,
         )
 
         self.aux_stream = aux_stream
@@ -654,6 +658,9 @@ class MLA(nn.Module):
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # May concat q(including q_pe), k + k_pe, v together
+        print("czq q.shape", q.shape)
+        print("czq k.shape", k.shape)
+        print("czq v.shape", v.shape)
         q, k, v = self._maybe_concat_qkv(q, k, v)
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
@@ -668,8 +675,10 @@ class MLA(nn.Module):
             latent_cache=latent_cache,
             out_scale=out_scale,
         )
+        print("czq attn_output.shape", attn_output.shape)
 
         return attn_output
+        # return torch.ones((16,2048))
 
     def forward_generation(
         self,
