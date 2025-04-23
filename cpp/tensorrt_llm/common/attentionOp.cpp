@@ -270,7 +270,6 @@ int AttentionOp::ulyssesContextCP2TP(T const* input, T* output, T* buffer, Enque
     int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
     cudaStream_t stream)
 {
-    // return 0;
     // 这里的mCpSize理论上应该是 mCpSize / mAttnCpSize,即需要转TP的CP数，不过mAttnCpSize暂时只能是1 or mCpSize
     // rank 应该是 mCpRank % (mCpSize / mAttnCpSize)
     int32_t partialTokenNum = 0;
@@ -336,11 +335,86 @@ int AttentionOp::ulyssesContextCP2TP(T const* input, T* output, T* buffer, Enque
     // transpose_2 as [NumTokens, partialHead, headSize]
     // and this is same to the input under TP.
 
+            if (rank == 0)
+            {
+                printf("czq attn cp2tp input %p", input);
+                for (int idx = 0; idx < 5 * 32; ++idx)
+                {
+                    const int tid = idx / 32;
+                    const int hid = idx % 32;
+
+                    const int bufSize = 128;
+                    const int line = 128;
+                    const int lineN = 128;
+                    std::vector<T> host_buf(bufSize, 0);
+                    cudaMemcpyAsync(host_buf.data(), input + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    for (int i=0;i<host_buf.size();++i)
+                    {
+                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
+                        if (i % line < lineN) 
+                            printf("%f ", float(host_buf[i]));
+                    }
+                    printf("end \n");
+                    sync_check_cuda_error(stream);
+                }
+            }
+
     // view_1 + transpose_1
     invokeCpTranspose(output, buffer, input, partialTokenNum, size, numHeadsOutput, mNumAttnKVHeads,
         mUlyssesMQABroadcast, headSizeQ, headSizeK, headSizeV, rank, stream);
     sync_check_cuda_error(stream);
 
+            if (rank == 0)
+            {
+                printf("czq attn cp2tp trans output %p", output);
+                for (int idx = 0; idx < 5 * 32; ++idx)
+                {
+                    const int tid = idx / 32;
+                    const int hid = idx % 32;
+
+                    const int bufSize = 128;
+                    const int line = 128;
+                    const int lineN = 128;
+                    std::vector<T> host_buf(bufSize, 0);
+                    cudaMemcpyAsync(host_buf.data(), output + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    for (int i=0;i<host_buf.size();++i)
+                    {
+                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
+                        if (i % line < lineN) 
+                            printf("%f ", float(host_buf[i]));
+                    }
+                    printf("end \n");
+                    sync_check_cuda_error(stream);
+                }
+            }
+            if (rank == 0)
+            {
+                printf("czq attn cp2tp trans buffer %p", buffer);
+                for (int idx = 0; idx < 5 * 32; ++idx)
+                {
+                    const int tid = idx / 32;
+                    const int hid = idx % 32;
+
+                    const int bufSize = 128;
+                    const int line = 128;
+                    const int lineN = 128;
+                    std::vector<T> host_buf(bufSize, 0);
+                    cudaMemcpyAsync(host_buf.data(), buffer + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    for (int i=0;i<host_buf.size();++i)
+                    {
+                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
+                        if (i % line < lineN) 
+                            printf("%f ", float(host_buf[i]));
+                    }
+                    printf("end \n");
+                    sync_check_cuda_error(stream);
+                }
+            }
+
+    return 0;
     // Do all to all
 #if ENABLE_MULTI_DEVICE
     ncclGroupStart();
@@ -388,40 +462,36 @@ int AttentionOp::ulyssesContextTP2CP(T const* input, T* output, T* buffer, Enque
     int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
     cudaStream_t stream)
 {
-    // TP2CP
-
     // After FMHA, we get result [numTokens(bs, cp, paritalLength), partialHead, headSize]
     // transpose_2_reverse: [cpSize_Length, partialTokens(bs, partialLength), partialHead, headSize]
     // all-to-all: [cpSize_Head, partialTokens, partialHead, headSize]
     // transpose_1_reverse: [partialTokens, cpSize_Head, partialHead, headSize]
     // view: [partialTokens, head, headSize]
 
-    if (rank == 0)
-    {
-        printf("czq attn qkv input origin %p", input);
-        for (int idx = 0; idx < 10 * 16; ++idx)
-        {
-            int const tid = idx / 16;
-            int const hid = idx % 16;
+            // if (rank == 0)
+            // {
+            //     printf("czq attn tp2cp input %p", input);
+            //     for (int idx = 0; idx < 10 * 16; ++idx)
+            //     {
+            //         const int tid = idx / 16;
+            //         const int hid = idx % 16;
 
-            int const bufSize = 512;
-            int const line = 64;
-            int const lineN = 64;
-            std::vector<T> host_buf(bufSize, 0);
-            cudaMemcpyAsync(
-                host_buf.data(), input + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-            sync_check_cuda_error(stream);
-            for (int i = 0; i < host_buf.size(); ++i)
-            {
-                if (i % line == 0)
-                    printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-                if (i % line < lineN)
-                    printf("%f ", float(host_buf[i]));
-            }
-            printf("end \n");
-            sync_check_cuda_error(stream);
-        }
-    }
+            //         const int bufSize = 512;
+            //         const int line = 64;
+            //         const int lineN = 64;
+            //         std::vector<T> host_buf(bufSize, 0);
+            //         cudaMemcpyAsync(host_buf.data(), input + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
+            //         sync_check_cuda_error(stream);
+            //         for (int i=0;i<host_buf.size();++i)
+            //         {
+            //             if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
+            //             if (i % line < lineN) 
+            //                 printf("%f ", float(host_buf[i]));
+            //         }
+            //         printf("end \n");
+            //         sync_check_cuda_error(stream);
+            //     }
+            // }
 
     int32_t maxPartialLength = 0;
     int32_t partialTokenNum = 0;
@@ -549,8 +619,6 @@ int AttentionOp::ulyssesContextTP2CP(T const* input, T* output, T* buffer, Enque
     ncclGroupEnd();
 #endif // ENABLE_MULTI_DEVICE
 
-       // cudaFreeAsync(d_array, stream);
-
     // transpose_1_reverse + view
     if (mFP8ContextFMHA)
     {
@@ -562,6 +630,30 @@ int AttentionOp::ulyssesContextTP2CP(T const* input, T* output, T* buffer, Enque
     {
         invokeCpTransposeToSeqMajor<T>((T*) output, buffer, buffer, partialTokenNum, size, hiddenSize, mCpRank, stream);
     }
+            if (rank == 0)
+            {
+                printf("czq attn tp2cp output %p", output);
+                for (int idx = 0; idx < 5 * 32; ++idx)
+                {
+                    const int tid = idx / 32;
+                    const int hid = idx % 32;
+
+                    const int bufSize = 512;
+                    const int line = 64;
+                    const int lineN = 64;
+                    std::vector<T> host_buf(bufSize, 0);
+                    cudaMemcpyAsync(host_buf.data(), output + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    for (int i=0;i<host_buf.size();++i)
+                    {
+                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
+                        if (i % line < lineN) 
+                            printf("%f ", float(host_buf[i]));
+                    }
+                    printf("end \n");
+                    sync_check_cuda_error(stream);
+                }
+            }
     return 0;
 }
 
@@ -876,12 +968,17 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 
     // cp workspace size upper bound
     size_t const cpMaxPaddedSequenceLength = max_num_tokens + batch_size * (std::max(mCpSize, mAttnCpSize) - 1);
-    size_t const cpWorkspaceSize = mCpSize == mAttnCpSize ? 0
-        : mIsMLAEnabled
-        ? (2 * size * cpMaxPaddedSequenceLength
-                * ((mMLAParams.qk_nope_head_dim * 3 + mMLAParams.qk_rope_head_dim * 2) * mNumAttnHeads)
-            + cu_seqlens_size)
-        : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads) + cu_seqlens_size);
+    size_t cpWorkspaceOffset = mCpSize == mAttnCpSize
+        ? 0
+        : mIsMLAEnabled ? cpMaxPaddedSequenceLength * (
+            (mMLAParams.qk_nope_head_dim * 3 + mMLAParams.qk_rope_head_dim * 2) * mNumAttnHeads
+            ) + cu_seqlens_size
+        : cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
+    cpWorkspaceOffset = roundUp(cpWorkspaceOffset, 16);
+    size_t cpWorkspaceSize = mCpSize == mAttnCpSize
+        ? 0
+        : 2 * size * cpWorkspaceOffset + cu_seqlens_size;
+    cpWorkspaceSize = roundUp(cpWorkspaceSize, 16);
     TLLM_LOG_ERROR("czq size %d", mMLAParams.qk_nope_head_dim * 3 + mMLAParams.qk_rope_head_dim * 2);
 
     int const NUM_BUFFERS = 20;
@@ -1472,15 +1569,18 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const fmha_bmm2_scale_size = mFP8ContextFMHA ? sizeof(float) : 0;
 
     // cp workspace size upper bound
-    size_t const cpMaxPaddedSequenceLength
-        = params.num_tokens + params.batch_size * (std::max(mCpSize, mAttnCpSize) - 1);
-    size_t const cpWorkspaceOffset = mCpSize == mAttnCpSize ? 0
-        : mIsMLAEnabled                                     ? cpMaxPaddedSequenceLength
-                * ((mMLAParams.qk_nope_head_dim * 3 + mMLAParams.qk_rope_head_dim * 2) * mNumAttnHeads)
-            + cu_seqlens_size
-                        : cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
-    size_t const cpWorkspaceSize = mCpSize == mAttnCpSize ? 0 : 2 * sizeof(T) * cpWorkspaceOffset + cu_seqlens_size;
-
+    size_t const cpMaxPaddedSequenceLength = params.num_tokens + params.batch_size * (std::max(mCpSize, mAttnCpSize) - 1);
+    size_t cpWorkspaceOffset = mCpSize == mAttnCpSize
+        ? 0
+        : mIsMLAEnabled ? cpMaxPaddedSequenceLength * (
+            (mMLAParams.qk_nope_head_dim * 3 + mMLAParams.qk_rope_head_dim * 2) * mNumAttnHeads
+            ) + cu_seqlens_size
+        : cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
+    cpWorkspaceOffset = roundUp(cpWorkspaceOffset, 16);
+    size_t cpWorkspaceSize = mCpSize == mAttnCpSize
+        ? 0
+        : 2 * sizeof(T) * cpWorkspaceOffset + cu_seqlens_size;
+    cpWorkspaceSize = roundUp(cpWorkspaceSize, 16);
     bool const is_qk_buf_float_ = true;
 
     // Workspace pointer shift
@@ -1660,21 +1760,24 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         //         const int tid = idx / 16;
         //         const int hid = idx % 16;
 
-        //         const int bufSize = 8192;
-        //         const int line = 64;
-        //         const int lineN = 8;
-        //         std::vector<T> host_buf(bufSize, 0);
-        //         cudaMemcpyAsync(host_buf.data(), params.attention_input, bufSize * sizeof(T), cudaMemcpyDeviceToHost,
-        //         stream); sync_check_cuda_error(stream); printf("czq attn qkv input origin %p",
-        //         params.attention_input); for (int i=0;i<host_buf.size();++i)
-        //         {
-        //             if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-        //             if (i % line < lineN)
-        //                 printf("%f ", float(host_buf[i]));
-        //         }
-        //         printf("end \n");
-        //     }
-        // }
+            //         const int bufSize = 8192;
+            //         const int line = 64;
+            //         const int lineN = 8;
+            //         std::vector<T> host_buf(bufSize, 0);
+            //         cudaMemcpyAsync(host_buf.data(), params.attention_input, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
+            //         sync_check_cuda_error(stream);
+            //         printf("czq attn qkv input origin %p", params.attention_input);
+            //         for (int i=0;i<host_buf.size();++i)
+            //         {
+            //             if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
+            //             if (i % line < lineN) 
+            //                 printf("%f ", float(host_buf[i]));
+            //         }
+            //         printf("end \n");
+            //     }
+            // }
+        
+        // TODO: can be const
         T* attention_input = const_cast<T*>(params.attention_input);
         if (mCpSize > mAttnCpSize)
         {

@@ -2238,10 +2238,20 @@ __global__ void runCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* sr
     for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
     {
         if (hiddenIdx < hiddenSize)
-            out[hiddenIdx] = in[hiddenIdx];
+        {
+                // TODO:adhoc why failed when use VecType
+                for (int i = 0; i < 8; ++i)
+                {
+                    reinterpret_cast<T*>(out)[hiddenIdx * 8 + i]
+                        = reinterpret_cast<T const*>(in)[hiddenIdx * 8 + i];
+                }
+            // out[hiddenIdx] = in[hiddenIdx];
+        }
         else
+        {
             reinterpret_cast<T*>(out + hiddenSize)[hiddenIdx - hiddenSize]
                 = reinterpret_cast<T const*>(in + hiddenSize)[hiddenIdx - hiddenSize];
+        }
     }
 }
 
@@ -2296,17 +2306,6 @@ __global__ void runCpTransposeToSeqMajor2(T* dstMyRank, T* dstOtherRank, T const
     int32_t const* cu_q_seqlens, int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength,
     int64_t batchSize, int64_t hiddenSize, int64_t rank)
 {
-    // using VecType = float4;
-    //     VecType* out = reinterpret_cast<VecType*>(dst);
-    //     VecType const* in = reinterpret_cast<VecType const*>(src);
-    //     for (int i = 0; i < 1; ++i)
-    //     {
-    //         // dst[i] = src[i]; // ok
-    //         auto temp = in[i];
-    //         out[i] = temp;
-    //     }
-    //     return;
-
     // TODO: fix comments ?
     // Do transpose from
     // [tokens(bs, cp, paritalLength), partialHeads, headSize]
@@ -2324,51 +2323,25 @@ __global__ void runCpTransposeToSeqMajor2(T* dstMyRank, T* dstOtherRank, T const
     int64_t tokenIdx = blockIdx.y;
     int64_t seqIdx = blockIdx.z;
     T* dst = cpIdx == rank ? dstMyRank : dstOtherRank;
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
-    // {
-    //     printf("czq runCpTransposeToSeqMajor2 q_seq_lengths %d %d %d, cu_q_seqlens %d %d %d, cu_cp_partial_seqlens %d
-    //     %d %d\n",
-    //         q_seq_lengths[0], q_seq_lengths[1], q_seq_lengths[2],
-    //         cu_q_seqlens[0], cu_q_seqlens[1], cu_q_seqlens[2],
-    //         cu_cp_partial_seqlens[0], cu_cp_partial_seqlens[1], cu_cp_partial_seqlens[2]);
-    // }
-    // cid=1 sid=0
     int64_t length = q_seq_lengths[seqIdx];
-    // 2
     int64_t partialLength = (length + cpSize - 1) / cpSize;
-    // 0 + 2 * 1
-    int64_t partialLengthInIdx = cu_q_seqlens[seqIdx] + partialLength * cpIdx; // cpMajor
-    // 5 * 1 + 0
+    int64_t partialLengthInIdx = cu_q_seqlens[seqIdx] + partialLength * cpIdx;                            // cpMajor
     int64_t partialLengthOutIdx = cu_cp_partial_seqlens[batchSize] * cpIdx + cu_cp_partial_seqlens[seqIdx]; // bsMajor
-    // q_seq_lengths 4 5 0, cu_q_seqlens 0 4 9, cu_cp_partial_seqlens 0 2 5
     if (cpIdx + 1 == cpSize)
     {
         partialLength = length - partialLength * (cpSize - 1);
     }
-    // if (threadIdx.x == 0)
-    // {
-    //     printf("czqtgt2 cid%d,tid%d,sid%d partialLengthOutIdx %d, partialLengthInIdx %d, outMax %d, inMax %d\n",
-    //         int(cpIdx), int(tokenIdx), int(seqIdx), int(partialLengthOutIdx), int(partialLengthInIdx),
-    //         int(partialLengthOutIdx + partialLength) * hiddenSize, int(partialLengthInIdx + partialLength) *
-    //         hiddenSize);
-    // }
     for (int partialTokenIdx = tokenIdx; partialTokenIdx < partialLength; partialTokenIdx += maxPartalLength)
     {
-        VecType* out = reinterpret_cast<VecType*>(dst + (partialLengthOutIdx + partialTokenIdx) * hiddenSize);
-        // = reinterpret_cast<VecType*>(dst);
-        VecType const* in = reinterpret_cast<VecType const*>(src + (partialLengthInIdx + partialTokenIdx) * hiddenSize);
-        // = reinterpret_cast<VecType const*>(src);
-        // for (int i = 0; i < 8; ++i)
-        // {
-        //     // dst[i] = src[i]; // ok
-        //     // out[i] = in[i]; // ok
-        // }
+        VecType* out
+            = reinterpret_cast<VecType*>(dst + (partialLengthOutIdx + partialTokenIdx) * hiddenSize);
+        VecType const* in
+            = reinterpret_cast<VecType const*>(src + (partialLengthInIdx + partialTokenIdx) * hiddenSize);
         for (int hiddenIdx = threadIdx.x; hiddenIdx < vecNum + restNum; hiddenIdx += blockDim.x)
         {
-            // out[0] = in[0];
-
             if (hiddenIdx < vecNum)
             {
+                // TODO:adhoc why failed when use VecType
                 for (int i = 0; i < 8; ++i)
                 {
                     reinterpret_cast<T*>(out)[hiddenIdx * 8 + i] = reinterpret_cast<T const*>(in)[hiddenIdx * 8 + i];
@@ -2386,10 +2359,6 @@ __global__ void runCpTransposeToSeqMajor2(T* dstMyRank, T* dstOtherRank, T const
             //     reinterpret_cast<T*>(out + vecNum)[hiddenIdx - vecNum]
             //         = reinterpret_cast<T const*>(in + vecNum)[hiddenIdx - vecNum];
         }
-        // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
-        // {
-        //     printf("czq out %p, %d, in %p, %d\n", dst, float(dst[0]), src, float(src[0]));
-        // }
     }
 }
 
