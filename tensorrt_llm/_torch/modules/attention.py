@@ -1218,9 +1218,12 @@ class VanillaMLA(nn.Module):
         # Control reduce output.
         self.wo.reduce_output = all_reduce_params.enable_allreduce
 
+        # import pdb; pdb.set_trace()
         if attn_metadata is None or attn_metadata.kv_cache_manager is None:
             return self.dummy_forward(hidden_states)
 
+        print("MLA Vanilla forward start", hidden_states.shape)
+        # print("attn_metadata.seq_lens", attn_metadata.seq_lens) # e.g. [4,5,1]
         max_seq_len = attn_metadata.kv_cache_manager.max_seq_len
         if self.freqs_cis is None or max_seq_len > self.freqs_cis.shape[0]:
             self.freqs_cis = self.precompute_freqs_cis(max_seq_len=max_seq_len,
@@ -1237,6 +1240,8 @@ class VanillaMLA(nn.Module):
         assert len(cache_indices) == len(past_seen_tokens)
         assert len(cache_indices) == attn_metadata.seq_lens.nelement()
 
+        # Ulysses preprocess
+
         offset = 0
         attn_outputs = []
         for i, seq_len in enumerate(attn_metadata.seq_lens):
@@ -1251,4 +1256,7 @@ class VanillaMLA(nn.Module):
             offset += seq_len
 
         attn_output = torch.cat(attn_outputs, dim=0).contiguous()
+
+        # Ulysses postprocess
+
         return attn_output

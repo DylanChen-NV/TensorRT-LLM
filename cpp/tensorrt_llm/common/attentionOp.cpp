@@ -265,507 +265,6 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     return true;
 }
 
-template <typename T>
-int AttentionOp::ulyssesContextCP2TP(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
-    int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
-    cudaStream_t stream)
-{
-    // 这里的mCpSize理论上应该是 mCpSize / mAttnCpSize,即需要转TP的CP数，不过mAttnCpSize暂时只能是1 or mCpSize
-    // rank 应该是 mCpRank % (mCpSize / mAttnCpSize)
-    int32_t partialTokenNum = 0;
-    int32_t maxPartialLength = 0;
-    for (int32_t batchIdx = 0; batchIdx < params.batch_size; ++batchIdx)
-    {
-        int32_t partialLength = (params.host_context_lengths[batchIdx] + size - 1) / size;
-        maxPartialLength = std::max(maxPartialLength, partialLength);
-        partialTokenNum += partialLength;
-    }
-
-    int64_t numHeadsOutput, partialHeads, partialHiddenSize, headSizeQ, headSizeK, headSizeV;
-    if (isPreprocess)
-    {
-        numHeadsOutput = mNumAttnHeads;
-        if (mIsMLAEnabled) // TODO adhoc 默认 MLA 是 TP GEMM + CP Attn, 后续把入口集中下有个dispatcher
-        {
-            TLLM_CHECK_WITH_INFO(false, "czq CP2TP-preprocess-MLA not implemented");
-        }
-        else
-        {
-            partialHeads = numHeadsOutput + 2 * mNumAttnKVHeads;
-            partialHiddenSize = partialHeads * getHeadSize();
-            headSizeQ = getHeadSize();
-            headSizeK = getHeadSize();
-            headSizeV = getHeadSize();
-        }
-    }
-    else
-    {
-        numHeadsOutput = mNumHeads;
-        if (mIsMLAEnabled)
-        {
-            // is postprocess
-            partialHeads = mMLAParams.qk_nope_head_dim;
-            partialHiddenSize = partialHeads * mMLAParams.qk_nope_head_dim;
-            headSizeQ = mMLAParams.qk_nope_head_dim;
-            headSizeK = 0;
-            headSizeV = 0;
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(false, "czq CP2TP-postprocess-MHA not implemented");
-        }
-    }
-
-    // full request: [bs, seqlen, head, headSize]
-    //
-    // input of cp: [bs, partialLength, head, headSize]
-    // view_1 as [bs, partialLength, cpSize_Head, partialHead, headSize]
-    // transpose_1 as [cpSize_Head, bs, partialLenth, partialHead, headSize]
-    // all-to-all to get [cpSize_Length, bs, partialLength, partialHead, headSize]
-    // transpose_2 to [bs, cpSize_Length, partialLength, partialHead, headSize]
-    // view_2 as [bs, totalLength, partialHead, headSize]
-    // and this is same to the input under TP.
-    //
-    // when we use remove_input_padding, bs and length are fused into numTokens. So, we need to
-    // insert the cpSize_Length dimension of transpose_2 into numTokens directly like
-    // input of cp: [partialNumTokens, head, headSize]
-    // view_1 as [partialNumTokens, cpSize_Head, partialHead, headSize]
-    // transpose_1 as [cpSize_Head, partialNumTokens, partialHead, headSize]
-    // all-to-all to get [cpSize_Length, partialNumTokens, partialHead, headSize]
-    // transpose_2 as [NumTokens, partialHead, headSize]
-    // and this is same to the input under TP.
-
-            if (rank == 0)
-            {
-                printf("czq attn cp2tp input %p", input);
-                for (int idx = 0; idx < 5 * 32; ++idx)
-                {
-                    const int tid = idx / 32;
-                    const int hid = idx % 32;
-
-                    const int bufSize = 128;
-                    const int line = 128;
-                    const int lineN = 128;
-                    std::vector<T> host_buf(bufSize, 0);
-                    cudaMemcpyAsync(host_buf.data(), input + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-                    sync_check_cuda_error(stream);
-                    for (int i=0;i<host_buf.size();++i)
-                    {
-                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-                        if (i % line < lineN) 
-                            printf("%f ", float(host_buf[i]));
-                    }
-                    printf("end \n");
-                    sync_check_cuda_error(stream);
-                }
-            }
-
-    // view_1 + transpose_1
-    invokeCpTranspose(output, buffer, input, partialTokenNum, size, numHeadsOutput, mNumAttnKVHeads,
-        mUlyssesMQABroadcast, headSizeQ, headSizeK, headSizeV, rank, stream);
-    sync_check_cuda_error(stream);
-
-            if (rank == 0)
-            {
-                printf("czq attn cp2tp trans output %p", output);
-                for (int idx = 0; idx < 5 * 32; ++idx)
-                {
-                    const int tid = idx / 32;
-                    const int hid = idx % 32;
-
-                    const int bufSize = 128;
-                    const int line = 128;
-                    const int lineN = 128;
-                    std::vector<T> host_buf(bufSize, 0);
-                    cudaMemcpyAsync(host_buf.data(), output + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-                    sync_check_cuda_error(stream);
-                    for (int i=0;i<host_buf.size();++i)
-                    {
-                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-                        if (i % line < lineN) 
-                            printf("%f ", float(host_buf[i]));
-                    }
-                    printf("end \n");
-                    sync_check_cuda_error(stream);
-                }
-            }
-            if (rank == 0)
-            {
-                printf("czq attn cp2tp trans buffer %p", buffer);
-                for (int idx = 0; idx < 5 * 32; ++idx)
-                {
-                    const int tid = idx / 32;
-                    const int hid = idx % 32;
-
-                    const int bufSize = 128;
-                    const int line = 128;
-                    const int lineN = 128;
-                    std::vector<T> host_buf(bufSize, 0);
-                    cudaMemcpyAsync(host_buf.data(), buffer + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-                    sync_check_cuda_error(stream);
-                    for (int i=0;i<host_buf.size();++i)
-                    {
-                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-                        if (i % line < lineN) 
-                            printf("%f ", float(host_buf[i]));
-                    }
-                    printf("end \n");
-                    sync_check_cuda_error(stream);
-                }
-            }
-
-    return 0;
-    // Do all to all
-#if ENABLE_MULTI_DEVICE
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < size; cpIdx++)
-    {
-        if (cpIdx != rank)
-        {
-            NCCLCHECK(ncclSend(output + cpIdx * (partialTokenNum * partialHiddenSize),
-                (partialTokenNum * partialHiddenSize), (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-            NCCLCHECK(ncclRecv(buffer + cpIdx * (partialTokenNum * partialHiddenSize),
-                (partialTokenNum * partialHiddenSize), (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-        }
-    }
-    ncclGroupEnd();
-    sync_check_cuda_error(stream);
-#endif // ENABLE_MULTI_DEVICE
-
-    // transpose_2 + view_2
-    invokeCpTranspose2(output, buffer, params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens, size,
-        maxPartialLength, params.batch_size, partialHiddenSize, stream);
-
-    // if (rank == 0)
-    // {
-    //     const int bufSize = 16*16*128;
-    //     const int line = 64;
-    //     const int lineN = 4;
-    //     std::vector<T> host_buf(bufSize, 0);
-    //     cudaMemcpyAsync(host_buf.data(), output, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-    //     sync_check_cuda_error(stream);
-    //     printf("czq attn output final");
-    //     for (int i=0;i<host_buf.size();++i)
-    //     {
-    //         if (i % line == 0) printf("\nline%d:", i / line);
-    //         if (i % line < lineN)
-    //             printf("%f ", float(host_buf[i]));
-    //     }
-    //     printf("end \n");
-    // }
-
-    return 0;
-}
-
-template <typename T>
-int AttentionOp::ulyssesContextTP2CP(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
-    int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
-    cudaStream_t stream)
-{
-    // After FMHA, we get result [numTokens(bs, cp, paritalLength), partialHead, headSize]
-    // transpose_2_reverse: [cpSize_Length, partialTokens(bs, partialLength), partialHead, headSize]
-    // all-to-all: [cpSize_Head, partialTokens, partialHead, headSize]
-    // transpose_1_reverse: [partialTokens, cpSize_Head, partialHead, headSize]
-    // view: [partialTokens, head, headSize]
-
-            // if (rank == 0)
-            // {
-            //     printf("czq attn tp2cp input %p", input);
-            //     for (int idx = 0; idx < 10 * 16; ++idx)
-            //     {
-            //         const int tid = idx / 16;
-            //         const int hid = idx % 16;
-
-            //         const int bufSize = 512;
-            //         const int line = 64;
-            //         const int lineN = 64;
-            //         std::vector<T> host_buf(bufSize, 0);
-            //         cudaMemcpyAsync(host_buf.data(), input + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-            //         sync_check_cuda_error(stream);
-            //         for (int i=0;i<host_buf.size();++i)
-            //         {
-            //             if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-            //             if (i % line < lineN) 
-            //                 printf("%f ", float(host_buf[i]));
-            //         }
-            //         printf("end \n");
-            //         sync_check_cuda_error(stream);
-            //     }
-            // }
-
-    int32_t maxPartialLength = 0;
-    int32_t partialTokenNum = 0;
-    for (int32_t batchIdx = 0; batchIdx < params.batch_size; ++batchIdx)
-    {
-        int32_t partialLength = (params.host_context_lengths[batchIdx] + size - 1) / size;
-        maxPartialLength = std::max(maxPartialLength, partialLength);
-        partialTokenNum += partialLength;
-    }
-
-    int64_t numHeadsInput, hiddenSize;
-    if (isPreprocess)
-    {
-        numHeadsInput = mNumHeads;
-        if (mIsMLAEnabled) // TODO adhoc 默认 MLA 是 TP GEMM + CP Attn, 后续把入口集中下有个dispatcher
-        {
-            hiddenSize = (mMLAParams.qk_nope_head_dim * 3 + mMLAParams.qk_rope_head_dim * 2) * numHeadsInput;
-            TLLM_LOG_ERROR(
-                "czq TP2CP-preprocess-MLA hiddenSize %d, mMLAParams.qk_nope_head_dim %d, mMLAParams.qk_rope_head_dim "
-                "%d, numHeadsInput %d",
-                hiddenSize, mMLAParams.qk_nope_head_dim, mMLAParams.qk_rope_head_dim, numHeadsInput);
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(false, "czq TP2CP-preprocess-MHA not implemented");
-        }
-    }
-    else
-    {
-        numHeadsInput = mNumAttnHeads;
-        if (mIsMLAEnabled)
-        {
-            TLLM_CHECK_WITH_INFO(false, "czq TP2CP-postprocess-MLA not implemented");
-        }
-        else
-        {
-            hiddenSize = numHeadsInput * getHeadSize();
-        }
-    }
-
-    // transpose_2_reverse
-    if (mFP8ContextFMHA)
-    {
-        invokeCpTransposeToSeqMajor2(reinterpret_cast<__nv_fp8_e4m3*>(buffer), reinterpret_cast<__nv_fp8_e4m3*>(output),
-            reinterpret_cast<__nv_fp8_e4m3 const*>(input), params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens,
-            size, maxPartialLength, params.batch_size, hiddenSize, rank, stream);
-    }
-    else
-    {
-        invokeCpTransposeToSeqMajor2(buffer, output, input, params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens,
-            size, maxPartialLength, params.batch_size, hiddenSize, rank, stream);
-    }
-    // if (rank == 0)
-    // {
-    //     printf("czq attn qkv input after transpose_2_reverse %p", input);
-    //     for (int idx = 0; idx < 10 * 16; ++idx)
-    //     {
-    //         const int tid = idx / 16;
-    //         const int hid = idx % 16;
-
-    //         const int bufSize = 512;
-    //         const int line = 64;
-    //         const int lineN = 64;
-    //         std::vector<T> host_buf(bufSize, 0);
-    //         cudaMemcpyAsync(host_buf.data(), input + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost,
-    //         stream); sync_check_cuda_error(stream); for (int i=0;i<host_buf.size();++i)
-    //         {
-    //             if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-    //             if (i % line < lineN)
-    //                 printf("%f ", float(host_buf[i]));
-    //         }
-    //         printf("end \n");
-    //         sync_check_cuda_error(stream);
-    //     }
-    // }
-    // if (rank == 0)
-    // {
-    //     printf("czq attn qkv buffer after transpose_2_reverse %p", buffer);
-    //     for (int idx = 0; idx < 10 * 16; ++idx)
-    //     {
-    //         const int tid = idx / 16;
-    //         const int hid = idx % 16;
-
-    //         const int bufSize = 512;
-    //         const int line = 64;
-    //         const int lineN = 64;
-    //         std::vector<T> host_buf(bufSize, 0);
-    //         cudaMemcpyAsync(host_buf.data(), buffer + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost,
-    //         stream); sync_check_cuda_error(stream); for (int i=0;i<host_buf.size();++i)
-    //         {
-    //             if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-    //             if (i % line < lineN)
-    //                 printf("%f ", float(host_buf[i]));
-    //         }
-    //         printf("end \n");
-    //         sync_check_cuda_error(stream);
-    //     }
-    // }
-    // return 0;
-
-    // all-to-all
-#if ENABLE_MULTI_DEVICE
-    size_t elementNum = partialTokenNum * hiddenSize;
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < size; cpIdx++)
-    {
-        if (cpIdx != rank)
-        {
-            if (mFP8ContextFMHA)
-            {
-                NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(output) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mNcclComm, stream));
-                NCCLCHECK(ncclRecv(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mNcclComm, stream));
-            }
-            else
-            {
-                NCCLCHECK(ncclSend(
-                    output + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-                NCCLCHECK(ncclRecv(
-                    buffer + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-            }
-        }
-    }
-    ncclGroupEnd();
-#endif // ENABLE_MULTI_DEVICE
-
-    // transpose_1_reverse + view
-    if (mFP8ContextFMHA)
-    {
-        invokeCpTransposeToSeqMajor<__nv_fp8_e4m3>(reinterpret_cast<__nv_fp8_e4m3*>(output),
-            reinterpret_cast<__nv_fp8_e4m3 const*>(buffer), reinterpret_cast<__nv_fp8_e4m3 const*>(buffer),
-            partialTokenNum, size, hiddenSize, mCpRank, stream);
-    }
-    else
-    {
-        invokeCpTransposeToSeqMajor<T>((T*) output, buffer, buffer, partialTokenNum, size, hiddenSize, mCpRank, stream);
-    }
-            if (rank == 0)
-            {
-                printf("czq attn tp2cp output %p", output);
-                for (int idx = 0; idx < 5 * 32; ++idx)
-                {
-                    const int tid = idx / 32;
-                    const int hid = idx % 32;
-
-                    const int bufSize = 512;
-                    const int line = 64;
-                    const int lineN = 64;
-                    std::vector<T> host_buf(bufSize, 0);
-                    cudaMemcpyAsync(host_buf.data(), output + idx * bufSize, bufSize * sizeof(T), cudaMemcpyDeviceToHost, stream);
-                    sync_check_cuda_error(stream);
-                    for (int i=0;i<host_buf.size();++i)
-                    {
-                        if (i % line == 0) printf("\ntid%d,hid%d,line%d:", tid, hid, i / line);
-                        if (i % line < lineN) 
-                            printf("%f ", float(host_buf[i]));
-                    }
-                    printf("end \n");
-                    sync_check_cuda_error(stream);
-                }
-            }
-    return 0;
-}
-
-template <typename T>
-int AttentionOp::ulyssesGenerationPreprocess(
-    T const* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream)
-{
-    if (mCpSize <= 1)
-        return 0;
-
-    auto const partialTokenNum = (batch_beam + mCpSize - 1) / mCpSize;
-    int64_t headSizeQ = getHeadSize();
-    int64_t headSizeK = getHeadSize();
-    int64_t headSizeV = getHeadSize();
-
-    // attention_input shape: [partialTokenNum, numHeads, headSize]
-    // view_1: [partialTokenNum, cpSize_Head, partialHeads, headSize]
-    // transpose_1: [cpSize_Head, partialTokenNum, partialHeads, headSize]
-    // all-to-all to get [cpSize_Length, partialTokenNum, partialHead, headSize]
-    // view_2 as [tokens, partialHead, headSize]
-
-    // do transpose_1
-    // [1, mNumHeads + 2*mNumKVHeads, headSize]
-    // -> (view) [1, cpSize * mNumAttnHeads + cpSize * mNumAttnKVHeads + cpSize * partilKVHeads,
-    // headSize]
-    // -> (transpose) [cpSize, 1, mNumAttnHeads + mNumAttnKVHeads + mNumAttnKVHeads, headSize]
-    invokeCpTranspose(buffer, output, input, partialTokenNum, mCpSize, mNumAttnHeads, mNumAttnKVHeads,
-        mUlyssesMQABroadcast, headSizeQ, headSizeK, headSizeV, mCpRank, stream);
-    sync_check_cuda_error(stream);
-
-    // Do all to all
-#if ENABLE_MULTI_DEVICE
-    auto const partialHeads = mNumAttnHeads + 2 * mNumAttnKVHeads;
-
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
-    {
-        if (cpIdx != mCpRank)
-        {
-            NCCLCHECK(ncclSend(buffer + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
-                (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-            NCCLCHECK(ncclRecv(output + cpIdx * (partialTokenNum * getHeadSize() * partialHeads),
-                (partialTokenNum * getHeadSize() * partialHeads), (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-        }
-    }
-    ncclGroupEnd();
-    sync_check_cuda_error(stream);
-#endif // ENABLE_MULTI_DEVICE
-    return 0;
-}
-
-template <typename T>
-int AttentionOp::ulyssesGenerationPostprocess(T* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream)
-{
-    if (mCpSize <= 1)
-        return 0;
-
-    // mmha output shape: [tokens, partialHead, headSize]
-    // view: [cpSize_Length, partialTokens, partialHead, headSize]
-    // all-to-all: [cpSize_Head, partialTokens, partialHead, headSize]
-    // transpose_1_reverse: [partialTokens, cpSize_Head, partialHead, headSize]
-    // view: [partialTokens, head, headSize]
-
-    auto const partialTokenNum = (batch_beam + mCpSize - 1) / mCpSize;
-    int64_t hiddenSize = mNumAttnHeads * getHeadSize();
-    // if (mIsMLAEnabled)
-    // {
-    //     hiddenSize = mNumAttnHeads * getHeadSize();
-    // }
-
-    // do all-to-all
-#if ENABLE_MULTI_DEVICE
-    size_t const elementNum = partialTokenNum * getHeadSize() * mNumAttnHeads;
-    ncclGroupStart();
-    for (int cpIdx = 0; cpIdx < mCpSize; cpIdx++)
-    {
-        if (cpIdx != mCpRank)
-        {
-            if (mFP8ContextFMHA)
-            {
-                NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mNcclComm, stream));
-                NCCLCHECK(ncclRecv(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum, ncclInt8,
-                    cpIdx, *mNcclComm, stream));
-            }
-            else
-            {
-                NCCLCHECK(ncclSend(
-                    input + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-                NCCLCHECK(ncclRecv(
-                    buffer + cpIdx * elementNum, elementNum, (*getDtypeMap())[mType], cpIdx, *mNcclComm, stream));
-            }
-        }
-    }
-    ncclGroupEnd();
-#endif // ENABLE_MULTI_DEVICE
-
-    // do transpose_1_reverse
-    if (mFP8ContextFMHA)
-    {
-        invokeCpTransposeToSeqMajor<__nv_fp8_e4m3>(reinterpret_cast<__nv_fp8_e4m3*>(output),
-            reinterpret_cast<__nv_fp8_e4m3 const*>(input), reinterpret_cast<__nv_fp8_e4m3 const*>(buffer),
-            partialTokenNum, mCpSize, hiddenSize, mCpRank, stream);
-    }
-    else
-    {
-        invokeCpTransposeToSeqMajor<T>(
-            (T*) output, input, buffer, partialTokenNum, mCpSize, hiddenSize, mCpRank, stream);
-    }
-    return 0;
-}
-
 template <typename T_MMHA, typename T, typename KVCacheBuffer, bool CROSS_ATTENTION>
 void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS_ATTENTION>& params,
     FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer> const& input_params, cudaStream_t stream)
@@ -1782,7 +1281,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mCpSize > mAttnCpSize)
         {
             // CP2TP
-            this->template ulyssesContextCP2TP<T>(attention_input, gatherInBuffer, gatherOutBuffer, params,
+            mUlyssesOp->ulyssesContextCP2TP<T>(attention_input, gatherInBuffer, gatherOutBuffer, params.batch_size, params.host_context_lengths, params.context_lengths,
                 cu_q_seqlens, cu_cp_partial_seqlens, mCpRank, mCpSize, true, stream);
             attention_input = gatherInBuffer;
             sync_check_cuda_error(stream);
@@ -1792,7 +1291,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         else if (mCpSize < mAttnCpSize)
         {
             // TP2CP
-            this->template ulyssesContextTP2CP<T>(attention_input, gatherInBuffer, gatherOutBuffer, params,
+            mUlyssesOp->ulyssesContextTP2CP<T>(attention_input, gatherInBuffer, gatherOutBuffer, params.batch_size, params.host_context_lengths, params.context_lengths,
                 cu_q_seqlens, cu_cp_partial_seqlens, mTpRank, mTpSize, true, stream);
             attention_input = gatherInBuffer;
             sync_check_cuda_error(stream);
@@ -1971,14 +1470,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         if (mCpSize > mAttnCpSize)
         {
-            this->template ulyssesContextTP2CP<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
-                gatherInBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, mCpRank, mCpSize, false, stream);
+            mUlyssesOp->ulyssesContextTP2CP<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
+                gatherInBuffer, params.batch_size, params.host_context_lengths, params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens, mCpRank, mCpSize, false, stream);
             sync_check_cuda_error(stream);
         }
         else if (mCpSize < mAttnCpSize)
         {
-            this->template ulyssesContextCP2TP<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
-                gatherInBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, mTpRank, mTpSize, false, stream);
+            mUlyssesOp->ulyssesContextCP2TP<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
+                gatherInBuffer, params.batch_size, params.host_context_lengths, params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens, mTpRank, mTpSize, false, stream);
             sync_check_cuda_error(stream);
         }
     }
@@ -2370,14 +1869,14 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     // 条件需要检查下
     if (mCpSize > mAttnCpSize)
     {
-        this->template ulyssesGenerationPreprocess<T>(attention_input, mhaInput, mhaOutput, batch_beam, stream);
+        mUlyssesOp->ulyssesGenerationPreprocess<T>(attention_input, mhaInput, mhaOutput, batch_beam, stream);
         attention_input = mhaInput;
         sync_check_cuda_error(stream);
     }
     else if (mCpSize < mAttnCpSize)
     {
-        // this->template ulyssesGenerationPostprocess<T>(
-        //     attention_input, gatherInBuffer, gatherOutBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, stream);
+        // mUlyssesOp->ulyssesGenerationPostprocess<T>(
+        //     attention_input, gatherInBuffer, gatherOutBuffer, params.batch_size, params.host_context_lengths, params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens, mTpRank, mTpSize, false, stream);
         // attention_input = gatherInBuffer;
         // sync_check_cuda_error(stream);
     }
@@ -2401,15 +1900,15 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             mXqaDispatcher->run(xqaParams, kv_cache_buffer);
             if (mCpSize > mAttnCpSize)
             {
-                this->template ulyssesGenerationPostprocess<T>(
+                mUlyssesOp->ulyssesGenerationPostprocess<T>(
                     mhaOutput, reinterpret_cast<T*>(params.context_buf), mhaInput, batch_beam, stream);
                 sync_check_cuda_error(stream);
             }
             else if (mCpSize < mAttnCpSize)
             {
-                // this->template ulyssesGenerationPreprocess<T>(
-                //     gatherOutBuffer, reinterpret_cast<T*>(params.context_buf), gatherInBuffer, params, cu_q_seqlens,
-                //     cu_cp_partial_seqlens, stream);
+                // mUlyssesOp->ulyssesGenerationPreprocess<T>(
+                //     gatherOutBuffer, reinterpret_cast<T*>(params.context_buf), gatherInBuffer, params.batch_size, params.host_context_lengths, params.context_lengths, cu_q_seqlens,
+                //     cu_cp_partial_seqlens, mTpRank, mTpSize, false, stream);
                 // sync_check_cuda_error(stream);
             }
             return 0;
@@ -2564,14 +2063,14 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     TLLM_LOG_ERROR("czq after mha mCpSize: %d, mAttnTpSize: %d, mAttnCpSize: %d", mCpSize, mAttnTpSize, mAttnCpSize);
     if (mCpSize > mAttnCpSize)
     {
-        this->template ulyssesGenerationPostprocess<T>(
+        mUlyssesOp->ulyssesGenerationPostprocess<T>(
             mhaOutput, reinterpret_cast<T*>(params.context_buf), mhaInput, batch_beam, stream);
         sync_check_cuda_error(stream);
     }
     else if (mCpSize < mAttnCpSize)
     {
-        // this->template ulyssesGenerationPreprocess<T>(
-        //     gatherOutBuffer, reinterpret_cast<T*>(params.context_buf), gatherInBuffer, params, cu_q_seqlens,
+        // mUlyssesOp->ulyssesGenerationPreprocess<T>(
+        //     gatherOutBuffer, reinterpret_cast<T*>(params.context_buf), gatherInBuffer, params.batch_size, params.host_context_lengths, params.context_lengths, cu_q_seqlens,
         //     cu_cp_partial_seqlens, stream);
         // sync_check_cuda_error(stream);
     }
@@ -2648,6 +2147,10 @@ int AttentionOp::initialize() noexcept
         // mqa broadcast
         mUlyssesMQABroadcast = (mAttnTpSize + mNumKVHeadsOrigin - 1) / mNumKVHeadsOrigin;
     }
+
+    mUlyssesOp = std::make_unique<op::UlyssesOp>(mCpSize, mCpRank, mCommGroup, mHeadSize, mNumHeads, mNumAttnHeads, mNumAttnKVHeads,
+        mNumKVHeadsOrigin, mTpSize, mTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mType,
+        mIsMLAEnabled, mMLAParams.qk_nope_head_dim, mMLAParams.qk_rope_head_dim);
 
     // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
@@ -3019,14 +2522,14 @@ int AttentionOp::initialize() noexcept
     {
         return 0;
     }
-#if ENABLE_MULTI_DEVICE
-    if (mCpSize != mAttnCpSize && COMM_SESSION.getSize() > 1)
-    {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-        mNcclComm = getComm(mCommGroup);
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-    }
-#endif // ENABLE_MULTI_DEVICE
+// #if ENABLE_MULTI_DEVICE
+//     if (mCpSize != mAttnCpSize && COMM_SESSION.getSize() > 1)
+//     {
+//         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+//         mNcclComm = getComm(mCommGroup);
+//         TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+//     }
+// #endif // ENABLE_MULTI_DEVICE
     return 0;
 }
 

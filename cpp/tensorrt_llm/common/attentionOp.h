@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "ulyssesOp.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -228,22 +229,6 @@ public:
     bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
         EnqueueGenerationParams<T> const& generationsParams, bool forConfigurePlugin);
 
-    template <typename T>
-    int ulyssesContextCP2TP(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
-        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
-        cudaStream_t stream);
-
-    template <typename T>
-    int ulyssesContextTP2CP(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
-        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, int rank, int size, bool isPreprocess,
-        cudaStream_t stream);
-
-    template <typename T>
-    int ulyssesGenerationPreprocess(T const* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
-
-    template <typename T>
-    int ulyssesGenerationPostprocess(T* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
-
     [[nodiscard]] bool isRelativePosition() const
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE;
@@ -384,6 +369,7 @@ public:
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
+    std::shared_ptr<UlyssesOp> mUlyssesOp;
     int mCpSize = 1;
     int mCpRank = 0;
     std::set<int32_t> mCommGroup = {};

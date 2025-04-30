@@ -2400,6 +2400,7 @@ void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, i
 INSTANTIATE_invokeCpTranspose(float);
 INSTANTIATE_invokeCpTranspose(half);
 INSTANTIATE_invokeCpTranspose(__nv_bfloat16);
+INSTANTIATE_invokeCpTranspose(__nv_fp8_e4m3);
 #undef INSTANTIATE_invokeCpTranspose
 
 template <typename T>
@@ -2440,6 +2441,7 @@ void invokeCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int3
 INSTANTIATE_invokeCpTranspose2(float);
 INSTANTIATE_invokeCpTranspose2(half);
 INSTANTIATE_invokeCpTranspose2(__nv_bfloat16);
+INSTANTIATE_invokeCpTranspose2(__nv_fp8_e4m3);
 #undef INSTANTIATE_invokeCpTranspose2
 
 template <typename T>
