@@ -17,7 +17,7 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
 
 E2M1_MAX = 6.0
-
+# czq_i = 0
 
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
@@ -320,14 +320,38 @@ class Linear(nn.Module):
                 else:
                     qinput = input
                 # This op does not support bias now.
-                output = torch.ops.trtllm.cublas_scaled_mm(
-                    qinput,
-                    weight.t(),
-                    scale_a=cur_input_scale,
-                    scale_b=self.weight_scale,
-                    bias=None,
-                    out_dtype=self.dtype or input.dtype,
-                )
+                # if self.weights_loading_config.weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                # if True:
+                if qinput.shape[0] == 1:
+                    # print("czq{}{} linear qinput{}: {}, weight{}: {}, cur_input_scale{}: {}, self.weight_scale{}: {}".format( czq_i, self.dtype or input.dtype, 
+                    #     qinput.dtype, qinput.shape, weight.dtype, weight.shape, cur_input_scale.dtype, cur_input_scale.shape, self.weight_scale.dtype, self.weight_scale.shape))
+                    output = torch.ops.trtllm.cuda_scaled_mm(
+                        qinput,
+                        weight.t(),
+                        scale_a=cur_input_scale,
+                        scale_b=self.weight_scale,
+                        bias=None,
+                        out_dtype=self.dtype or input.dtype,
+                    )
+                else:
+                    # print("czq qinput.shape: {}, weight.shape: {}".format( qinput.shape, weight.shape))
+                    output = torch.ops.trtllm.cublas_scaled_mm(
+                        qinput,
+                        weight.t(),
+                        scale_a=cur_input_scale,
+                        scale_b=self.weight_scale,
+                        bias=None,
+                        out_dtype=self.dtype or input.dtype,
+                    )
+                
+                # output = torch.ops.trtllm.cublas_scaled_mm(
+                #     qinput,
+                #     weight.t(),
+                #     scale_a=cur_input_scale,
+                #     scale_b=self.weight_scale,
+                #     bias=None,
+                #     out_dtype=self.dtype or input.dtype,
+                # )
                 if bias is not None:
                     output = output + bias
             elif self.has_fp8_block_scales:

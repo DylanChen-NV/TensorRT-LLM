@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemm.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -177,6 +178,39 @@ bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, std::shared_ptr<Cu
     return true;
 }
 
+void cuda_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
+    std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b, bool fast_acc = false)
+{
+    bool use_scale = false;
+    if (scale_a.has_value() && scale_b.has_value())
+    {
+        use_scale = true;
+    }
+
+    int32_t m = a.sizes()[0];
+    int32_t n = b.sizes()[1];
+    int32_t k = a.sizes()[1];
+    // printf("czq cudacore A %d %d B %d %d scale %d %d\n", int(m), int(k), int(b.sizes()[0]), int(n), int(scale_a.has_value()), int(scale_b.has_value()));
+
+    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+
+    auto* a_ptr = static_cast<void*>(a.data_ptr());
+    auto* b_ptr = static_cast<void*>(b.data_ptr());
+    auto* out_ptr = static_cast<void*>(out.data_ptr());
+    // auto* ws_ptr = static_cast<void*>(workspace.data_ptr());
+    void* a_scale = nullptr;
+    void* b_scale = nullptr;
+    if (use_scale)
+    {
+        a_scale = static_cast<void*>(scale_a.value().data_ptr());
+        b_scale = static_cast<void*>(scale_b.value().data_ptr());
+    }
+
+    tensorrt_llm::kernels::cuda_core_gemm::Params params(a_ptr, b_ptr, 2.0f, out_ptr, m, n, k);
+    tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmKernelNew<__nv_fp8_e4m3, __nv_bfloat16, 1, 2, 128>(reinterpret_cast<float const*>(a_scale), reinterpret_cast<float const*>(b_scale), params, stream);
+
+}
+
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b, bool fast_acc = false)
 {
@@ -301,6 +335,63 @@ Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& 
     return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
 }
 
+Tensor& cuda_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
+    std::optional<at::Tensor> const& bias, Tensor& out)
+{
+    // Check device
+    CHECK_TH_CUDA(mat_a);
+    CHECK_TH_CUDA(mat_b);
+    CHECK_TH_CUDA(scale_a);
+    CHECK_TH_CUDA(scale_b);
+    CHECK_TH_CUDA(out);
+
+    TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && out.dim() == 2);
+    // TORCH_CHECK(out.sizes()[0] == mat_a.sizes()[0] && mat_a.sizes()[1] == mat_b.sizes()[0]
+    //     && mat_b.sizes()[1] == out.sizes()[1]);
+    // TORCH_CHECK(out.sizes()[0] == mat_a.sizes()[0] && mat_a.sizes()[1] == mat_b.sizes()[1]
+    //     && mat_b.sizes()[0] == out.sizes()[1]);
+    TORCH_CHECK(scale_a.numel() == 1 || scale_a.numel() == mat_a.sizes()[0]);
+    TORCH_CHECK(scale_b.numel() == 1 || scale_b.numel() == mat_b.sizes()[1]);
+
+    // Check for strides and alignment
+    TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1);           // Row-major
+    // TORCH_CHECK(mat_b.strides()[0] == 1);                                    // Column-major
+    // TORCH_CHECK(mat_b.strides()[1] == 1);                                    // Column-major
+    // TORCH_CHECK(out.strides()[0] % 16 == 0 && mat_b.strides()[1] % 16 == 0); // 16 Byte Alignment
+    // TORCH_CHECK(out.strides()[0] % 16 == 0 && mat_b.strides()[0] % 16 == 0); // 16 Byte Alignment
+    TORCH_CHECK(scale_a.is_contiguous() && scale_b.is_contiguous());
+
+    TORCH_CHECK(!bias.has_value(), "bias is not support yet");
+
+    TORCH_CHECK(mat_a.dtype() == torch::kFloat8_e4m3fn);
+    TORCH_CHECK(mat_b.dtype() == torch::kFloat8_e4m3fn);
+
+    cuda_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, true);
+    return out;
+}
+
+Tensor cuda_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false)
+{
+    TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
+    auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
+
+    // std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[0]};
+    std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
+
+    Tensor out;
+    if (to_userbuffers)
+    {
+        out = torch_ext::create_userbuffers_tensor(output_size, out_dtype_).first;
+    }
+    else
+    {
+        out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
+    }
+
+    return cuda_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
+}
+
 Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias, Tensor& out)
 {
     // Check device
@@ -338,6 +429,9 @@ Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Ten
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        "cuda_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
+        " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
+    m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
         " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
     m.def(
@@ -350,5 +444,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cublas_scaled_mm", &torch_ext::cublas_scaled_mm);
+    m.impl("cuda_scaled_mm", &torch_ext::cuda_scaled_mm);
     m.impl("cublas_mm", &torch_ext::cublas_mm);
 }
