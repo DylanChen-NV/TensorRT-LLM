@@ -25,6 +25,147 @@ namespace kernels
 namespace cuda_core_gemm
 {
 template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
+__global__ void cudaCoreGemmNew(InputType const* __restrict__ act, InputType const* __restrict__ weight, float const* __restrict__ scale_a, float const* __restrict__ scale_b,
+    OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
+{
+    using VecType = int4;
+    static constexpr SizeType32 kStepK = static_cast<SizeType32>(128 / (8 * sizeof(InputType)));
+    static constexpr SizeType32 kTileK = kStepK * BLOCK_SIZE;
+    auto tileIdM = static_cast<SizeType32>(blockIdx.x * TILE_M);
+    auto tileIdN = static_cast<SizeType32>(blockIdx.y * TILE_N);
+    auto tid = static_cast<SizeType32>(threadIdx.x);
+    float tile_a[kStepK], tile_w[TILE_N * kStepK];
+    float acc[TILE_M * TILE_N];
+
+    static_assert(kStepK % 4 == 0);
+    using CvtInputType = typename tensorrt_llm::kernels::cutlass_kernels::TllmToCutlassTypeAdapter<InputType>::type;
+    using Converter = cutlass::NumericArrayConverter<float, CvtInputType, 4>;
+    using CvtSrcType = typename Converter::source_type;
+    using CvtResType = typename Converter::result_type;
+    static constexpr SizeType32 kCvtCount = static_cast<SizeType32>(sizeof(VecType) / sizeof(CvtSrcType));
+
+#pragma unroll
+    for (SizeType32 i = 0; i < TILE_M * TILE_N; ++i)
+    {
+        acc[i] = 0;
+    }
+    act += tileIdM * k;
+    weight += tileIdN * k;
+    output += tileIdM * n + tileIdN;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    for (SizeType32 idxK = tid * kStepK; idxK < k; idxK += kTileK)
+    {
+        for (SizeType32 i = 0; i < TILE_N; ++i)
+        {
+            auto tile_w_quantized = reinterpret_cast<VecType const*>(weight + i * k + idxK)[0];
+#pragma unroll
+            for (SizeType32 cvtIdx = 0; cvtIdx < kCvtCount; ++cvtIdx)
+            {
+                reinterpret_cast<CvtResType*>(tile_w)[i * kCvtCount + cvtIdx]
+                    = Converter::convert(reinterpret_cast<CvtSrcType*>(&tile_w_quantized)[cvtIdx]);
+            }
+        }
+#pragma unroll
+        for (SizeType32 i = 0; i < TILE_M; ++i)
+        {
+            auto tile_a_quantized = reinterpret_cast<VecType const*>(act + i * k + idxK)[0];
+#pragma unroll
+            for (SizeType32 cvtIdx = 0; cvtIdx < kCvtCount; ++cvtIdx)
+            {
+                reinterpret_cast<CvtResType*>(tile_a)[cvtIdx]
+                    = Converter::convert(reinterpret_cast<CvtSrcType*>(&tile_a_quantized)[cvtIdx]);
+            }
+#pragma unroll
+            for (SizeType32 j = 0; j < TILE_N; ++j)
+            {
+#pragma unroll
+                for (SizeType32 l = 0; l < kStepK; ++l)
+                {
+                    acc[i * TILE_N + j] = fma(tile_a[l], tile_w[j * kStepK + l], acc[i * TILE_N + j]);
+                }
+            }
+        }
+    }
+
+    typedef cub::WarpReduce<float> WarpReduce;
+
+    static constexpr SizeType32 kWarpSize = 32;
+    static constexpr SizeType32 kWarpNum = BLOCK_SIZE / kWarpSize;
+    SizeType32 warpId = tid / kWarpSize, laneId = tid % kWarpSize;
+    __shared__ float shmem[TILE_M * TILE_N * kWarpNum];
+    __shared__ typename WarpReduce::TempStorage tempStorage[kWarpNum];
+#pragma unroll
+    for (SizeType32 mi = 0; mi < TILE_M; ++mi)
+    {
+#pragma unroll
+        for (SizeType32 ni = 0; ni < TILE_N; ++ni)
+        {
+            float val = WarpReduce(tempStorage[warpId]).Sum(acc[mi * TILE_N + ni]);
+            if (laneId == 0)
+            {
+                shmem[mi * TILE_N + ni + warpId * TILE_M * TILE_N] = val;
+            }
+        }
+    }
+    __syncthreads();
+    float alpha = scale_a[0] * scale_b[0];
+    for (SizeType32 ii = tid; ii < TILE_M * TILE_N; ii += BLOCK_SIZE)
+    {
+        SizeType32 mid = ii / TILE_N, nid = ii % TILE_N;
+        float val = 0;
+#pragma unroll
+        for (SizeType32 jj = 0; jj < kWarpNum; ++jj)
+        {
+            val += shmem[jj * TILE_M * TILE_N + ii];
+        }
+        output[mid * n + nid] = static_cast<OutputType>(val * alpha);
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
+void cudaCoreGemmKernelNew(float const* scale_a, float const* scale_b, Params const& params, cudaStream_t stream)
+{
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(params.m / TILE_M, params.n / TILE_N);
+
+    if (tensorrt_llm::common::getEnvEnablePDL())
+    {
+        TLLM_LOG_DEBUG("Enable PDL in fp8_gemm_plugin");
+        cudaLaunchConfig_t kernelConfig = {0};
+        kernelConfig.gridDim = grid;
+        kernelConfig.blockDim = block;
+        kernelConfig.dynamicSmemBytes = 0;
+        kernelConfig.stream = stream;
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        kernelConfig.attrs = attribute;
+        kernelConfig.numAttrs = 1;
+
+        TLLM_CUDA_CHECK(
+            cudaLaunchKernelEx(&kernelConfig, cudaCoreGemmNew<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>,
+                reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+                scale_a, scale_b, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k));
+    }
+    else
+    {
+        cudaCoreGemmNew<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+            reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+            scale_a, scale_b, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+    }
+}
+template void cudaCoreGemmKernelNew<__nv_fp8_e4m3, __nv_bfloat16, 1, 2, 128>(float const* scale_a, float const* scale_b, Params const& params, cudaStream_t stream);
+
+template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
 __global__ void cudaCoreGemm(InputType const* __restrict__ act, InputType const* __restrict__ weight, float alpha,
     OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
 {

@@ -69,9 +69,22 @@ struct Params
         , outputType(_outputType)
     {
     }
+    Params(void const* _act, void const* _weight, float _alpha, void* _output, SizeType32 _m, SizeType32 _n,
+        SizeType32 _k)
+        : act(_act)
+        , weight(_weight)
+        , alpha(_alpha)
+        , output(_output)
+        , m(_m)
+        , n(_n)
+        , k(_k)
+    {
+    }
 };
 
 bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream);
+template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
+void cudaCoreGemmKernelNew(float const* scale_a, float const* scale_b, Params const& params, cudaStream_t stream);
 } // namespace cuda_core_gemm
 } // namespace kernels
 } // namespace tensorrt_llm
