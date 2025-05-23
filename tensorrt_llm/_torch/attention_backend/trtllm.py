@@ -332,6 +332,8 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
 
+        if self.mrope_position_deltas is None and self.kv_scale_orig_quant is not None:
+            self.mrope_position_deltas = torch.zeros(batch_size, device='cuda', dtype=torch.int32)
         output = torch.ops.trtllm.attention(
             q,
             k,
