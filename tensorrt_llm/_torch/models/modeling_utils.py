@@ -475,9 +475,23 @@ class DecoderModelForCausalLM(nn.Module,
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
+                    elif not is_excluded and getattr(module, "quant_config",
+                                               None) is not None:
+                        # TODO: adhoc mix-precision for kv cache
+                        # if name.startswith("model.layers") and int(name.split(".")[2]) <14:
+                        if False:
+                            import copy
+                            temp_quant_config = copy.deepcopy(module.quant_config)
+                            temp_quant_config.kv_cache_quant_algo = None
+                            module.quant_config = temp_quant_config
+                            # print("czq set to bf16 kv", name, module.quant_config)
+                        else:
+                            pass
+                            # print("czq still fp8", name, module.quant_config)
 
-        for _, module in self.named_modules():
+        for name, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
+                # print("czq create_weights", name, module.quant_config)
                 module.create_weights()
 
     @property
