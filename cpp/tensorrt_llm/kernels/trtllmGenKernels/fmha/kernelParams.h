@@ -579,7 +579,7 @@ struct KernelParams
             /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
             /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-        if (true || result != CUDA_SUCCESS)
+        if (result != CUDA_SUCCESS)
         {
             char const* err_str;
             cuGetErrorString(result, &err_str);
@@ -595,7 +595,7 @@ struct KernelParams
             std::cout << "tileStrides: " << tileStrides[0] << " " << tileStrides[1] << " " << tileStrides[2] << " "
                       << tileStrides[3] << " " << tileStrides[4] << std::endl;
             std::cout << "swizzleType: " << int(swizzleType) << std::endl;
-            // TLLM_CHECK(false);
+            TLLM_CHECK(false);
         }
 
         return desc;

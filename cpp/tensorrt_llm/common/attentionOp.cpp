@@ -1281,6 +1281,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mCpSize > mAttnCpSize)
         {
             // CP2TP
+            TLLM_LOG_ERROR("czq context cp2tp input %p, gatherInBuffer %p, gatherOutBuffer %p", attention_input, gatherInBuffer, gatherOutBuffer);
             mUlyssesOp->ulyssesContextCP2TP<T>(attention_input, gatherInBuffer, gatherOutBuffer, params.batch_size, params.host_context_lengths, params.context_lengths,
                 cu_q_seqlens, cu_cp_partial_seqlens, mCpRank, mCpSize, true, stream);
             attention_input = gatherInBuffer;
@@ -2151,6 +2152,7 @@ int AttentionOp::initialize() noexcept
     mUlyssesOp = std::make_unique<op::UlyssesOp>(mCpSize, mCpRank, mCommGroup, mHeadSize, mNumHeads, mNumAttnHeads, mNumAttnKVHeads,
         mNumKVHeadsOrigin, mTpSize, mTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mType,
         mIsMLAEnabled, mMLAParams.qk_nope_head_dim, mMLAParams.qk_rope_head_dim);
+    mUlyssesOp->initialize();
 
     // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
@@ -2522,14 +2524,6 @@ int AttentionOp::initialize() noexcept
     {
         return 0;
     }
-// #if ENABLE_MULTI_DEVICE
-//     if (mCpSize != mAttnCpSize && COMM_SESSION.getSize() > 1)
-//     {
-//         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-//         mNcclComm = getComm(mCommGroup);
-//         TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-//     }
-// #endif // ENABLE_MULTI_DEVICE
     return 0;
 }
 

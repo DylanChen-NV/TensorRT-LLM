@@ -72,7 +72,6 @@ int UlyssesOp::ulyssesContextCP2TP(T const* input, T* output, T* buffer, int bat
         numHeadsOutput = mNumHeads;
         if (mIsMLAEnabled)
         {
-            // is postprocess
             partialHeads = mQkNopeHeadDim;
             partialHiddenSize = partialHeads * mQkNopeHeadDim;
             headSizeQ = mQkNopeHeadDim;

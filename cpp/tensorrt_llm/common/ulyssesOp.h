@@ -42,6 +42,7 @@ namespace tensorrt_llm::common::op
 class UlyssesOp
 {
 public:
+    UlyssesOp() = default;
     UlyssesOp(int cp_size, int cp_rank, const std::set<int32_t>& comm_group, int head_size, int num_heads, int num_attn_heads, int num_attn_kv_heads,
               int num_kv_heads_origin, int attn_tp_size, int attn_tp_rank, int attn_cp_size, int attn_cp_rank,
               int ulysses_mqa_broadcast, nvinfer1::DataType type, bool is_mla_enabled, int qk_nope_head_dim, int qk_rope_head_dim)
@@ -49,6 +50,11 @@ public:
           mNumAttnKVHeads(num_attn_kv_heads), mNumKVHeadsOrigin(num_kv_heads_origin), mAttnTpSize(attn_tp_size),
           mAttnTpRank(attn_tp_rank), mAttnCpSize(attn_cp_size), mAttnCpRank(attn_cp_rank), mUlyssesMQABroadcast(ulysses_mqa_broadcast),
           mType(type), mIsMLAEnabled(is_mla_enabled), mQkNopeHeadDim(qk_nope_head_dim), mQkRopeHeadDim(qk_rope_head_dim)
+    {
+    }
+    ~UlyssesOp() = default;
+
+    int initialize()
     {
 #if ENABLE_MULTI_DEVICE
     if (mCpSize != mAttnCpSize && COMM_SESSION.getSize() > 1)
@@ -58,10 +64,8 @@ public:
         TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     }
 #endif // ENABLE_MULTI_DEVICE
+    return 0;
     }
-    ~UlyssesOp() = default;
-
-    // int initialize() noexcept;
 
     template <typename T>
     int ulyssesContextCP2TP(T const* input, T* output, T* buffer, int32_t batch_size, int32_t const* host_context_lengths,
@@ -85,6 +89,8 @@ public:
     bool mIsMLAEnabled = false;
     int mCpSize = 1;
     int mCpRank = 0;
+    int mTpSize = 1;
+    int mTpRank = 0;
     std::set<int32_t> mCommGroup = {};
     // These parameters are used to specifically configure the attention attributes when cp/tp_size are different
     // between Attention and FFN(such as Ulysses)
