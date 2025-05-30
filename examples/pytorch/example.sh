@@ -13,5 +13,5 @@ FP8_MODEL="/path/to/TensorRT-Model-Optimizer/examples/vlm_ptq/saved_models_Qwen2
 # 运行并打印输出
 # 可在脚本中修改 example_image 和 example_image_prompts，从而指定输入
 MAX_OUTPUT_TOKENS=120
-python ./quickstart_multimodal.py --max_tokens ${MAX_OUTPUT_TOKENS} --model_dir $MODEL --use_cuda_graph
-python ./quickstart_multimodal.py --max_tokens ${MAX_OUTPUT_TOKENS} --model_dir $FP8_MODEL --use_cuda_graph
+python ./quickstart_multimodal.py --max_tokens ${MAX_OUTPUT_TOKENS} --model_dir $MODEL
+python ./quickstart_multimodal.py --max_tokens ${MAX_OUTPUT_TOKENS} --model_dir $FP8_MODEL
