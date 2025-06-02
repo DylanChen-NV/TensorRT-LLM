@@ -240,7 +240,7 @@ class LLM:
             else:
                 return maybe_batched
 
-        futures = []
+        futures = [None] * len(inputs)
         tasks_data = [{
             "request_inputs": request_inputs,
             "sampling_params": _item_at(sampling_params, i),
@@ -252,9 +252,9 @@ class LLM:
             "_postproc_params": None
         } for i, request_inputs in enumerate(inputs)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            futures_preprocess = []
-            for task_data in tasks_data:
-                futures_preprocess.append(executor.submit(self.generate_async,
+            futures_preprocess = {}
+            for task_id, task_data in enumerate(tasks_data):
+                task = executor.submit(self.generate_async,
                                           task_data["request_inputs"],
                                           task_data["sampling_params"],
                                           task_data["lora_request"],
@@ -264,11 +264,11 @@ class LLM:
                                           task_data["disaggregated_params"],
                                           task_data["_postproc_params"],
                                           )
-                )
+                futures_preprocess[task] = task_id
 
             for future_preprocess in concurrent.futures.as_completed(futures_preprocess):
                 try:
-                    futures.append(future_preprocess.result())
+                    futures[futures_preprocess[future_preprocess]] = future_preprocess.result()
                 except Exception as e:
                     print(f"concurrent Task generated an exception: {e}")
 
@@ -355,9 +355,9 @@ class LLM:
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
-            with nvtx_range_debug("input_processor"):
-                prompt_token_ids, extra_processed_inputs = self.input_processor(
-                    inputs, sampling_params)
+            # with nvtx_range_debug("input_processor"):
+            prompt_token_ids, extra_processed_inputs = self.input_processor(
+                inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
