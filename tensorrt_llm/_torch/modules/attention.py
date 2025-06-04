@@ -10,7 +10,7 @@ from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, allgather, reducescatter
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -827,6 +827,12 @@ class VanillaMLA(nn.Module):
         pp_size = config.mapping.pp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
+        self.tp_size = tp_size
+        self.tp_rank = config.mapping.tp_rank
+        self.mapping = config.mapping
+        if config.mapping.enable_attention_dp:
+            self.tp_size = 1
+            self.tp_rank = 0
 
         mapping = Mapping(
             world_size=tp_size * pp_size,
@@ -982,6 +988,7 @@ class VanillaMLA(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
         self.freqs_cis = None
+        self.flash_decoding = True
 
     def apply_rotary_emb(self, x: torch.Tensor,
                          freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -1073,14 +1080,18 @@ class VanillaMLA(nn.Module):
         if self.is_lite:
             q = self.wq(x)
         else:
+            # x: 1, 64, 128
             qnorm = self.q_norm(self.wq_a(x))
+            # qnorm: 1, 1536
             q = self.wq_b(qnorm)
         # q rope
         q = q.view(seqlen, self.n_local_heads, self.qk_head_dim)
+        # print("q.shape2", q.shape) # 1, 128/tp, 192
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = self.apply_rotary_emb(q_pe, self.freqs_cis[start_pos:end_pos])
         # kv proj a
+        # 1, 512
         kv = self.wkv_a(x)
         # kv rope
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim],
@@ -1091,6 +1102,7 @@ class VanillaMLA(nn.Module):
         if self.mla_weight_dtype == torch.bfloat16:
             wkv_b = self.wkv_b.weight.view(self.n_local_heads, -1,
                                            self.kv_lora_rank)
+            # 1, 128/tp, 512
             q_nope = torch.einsum("shd,hdc->shc", q_nope,
                                   wkv_b[:, :self.qk_nope_head_dim])
         elif self.mla_weight_dtype == torch.float8_e4m3fn:
@@ -1103,17 +1115,93 @@ class VanillaMLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Unsupported dtype: {self.mla_weight_dtype}")
+        # flash decoding A: 
+        # v1: allgather q_nope and q_pe
+        # v2: overlap with computation / combine q_nope and q_pe
+        if self.flash_decoding and seqlen == 1:
+            q_nope = allgather(q_nope, self.mapping, gather_dim=1)
+            q_nope = q_nope.view(seqlen, self.n_heads, self.kv_lora_rank)
+            q_pe = allgather(q_pe, self.mapping, gather_dim=1)
+            q_pe = q_pe.view(seqlen, self.n_heads, self.qk_rope_head_dim)
+        #####################
+        # [done] 先抛开 lse，做完整attention 然后split看正确性
+        # [done] 计算lse
+        # [done] 计算部分kv + reduce
+        # 
+        #####################
+
         # update kv cache
         kv_states, pe_states = self._single_request_update_kv_cache(
             self.kv_norm(kv), k_pe.squeeze(1), kv_cache_tensor, cache_idx,
             start_pos, end_pos)
+        # flash decoding B
+        # v1，kv/pe sp直接取一段
+        if self.flash_decoding and seqlen == 1:
+            part = end_pos // self.tp_size
+            sp_start = part * self.tp_rank
+            sp_end = part * (self.tp_rank + 1) if self.tp_rank + 1 < self.tp_size else end_pos
+            kv_states = kv_states[sp_start:sp_end, :]
+            pe_states = pe_states[sp_start:sp_end, :]
+        # v2，TODO: kv只存部分
+
         # attention
+        # flash decoding C
+        # 如何得到lse，并reduceScatter
         scores = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
             "shr,tr->sht", q_pe, pe_states)) * self.softmax_scale
         if mask is not None:
             scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+
+        # if False and self.flash_decoding:
+        if self.flash_decoding and seqlen == 1:
+            # 会有一些数值diff
+            scores_fp32 = scores.float()
+            lse = torch.logsumexp(scores_fp32, dim=-1, keepdim=True)
+            scores = torch.exp(scores_fp32 - lse).type_as(x)
+        else:
+            scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+
         x = torch.einsum("sht,tc->shc", scores, kv_states)
+
+        if self.flash_decoding and seqlen == 1:
+            # v1: all gather + split
+            head_start = self.n_local_heads * self.tp_rank
+            head_end = head_start + self.n_local_heads
+            x_blocks = allgather(x, self.mapping, gather_dim=0).float().view(self.tp_size, *x.shape)
+            lse_blocks = allgather(lse, self.mapping, gather_dim=0).view(self.tp_size, *lse.shape)
+            x_reduce = x_blocks[0]
+            lse_reduce = lse_blocks[0]
+            for i in range(1, self.tp_size):
+                x_block = x_blocks[i]
+                lse_block = lse_blocks[i]
+                lse_new = lse_reduce + torch.log(1 + torch.exp(lse_block - lse_reduce))
+                x_reduce = torch.exp(lse_reduce - lse_new) * x_reduce + torch.exp(
+                    lse_block - lse_new) * x_block
+                lse_reduce = lse_new
+            x = x_reduce[:, head_start:head_end, ...].type_as(x)
+
+        # if self.flash_decoding and seqlen == 1:
+        #     # v2: TODO 改成gather
+        #     x_blocks = []
+        #     lse_blocks = []
+        #     for i in range(self.tp_size):
+        #         head_start = self.n_local_heads * i
+        #         head_end = head_start + self.n_local_heads
+        #         # TODO: 需要初始化
+        #         torch.distributed.gather(x[:, head_start:head_end, ...], gather_list=x_blocks, dst=i)
+        #         torch.distributed.gather(lse[:, head_start:head_end, ...], gather_list=lse_blocks, dst=i)
+        #     x_reduce = x_blocks[0]
+        #     lse_reduce = lse_blocks[0]
+        #     for i in range(1, self.tp_size):
+        #         x_block = x_blocks[i]
+        #         lse_block = lse_blocks[i]
+        #         lse_new = lse_reduce + torch.log(1 + torch.exp(lse_block - lse_reduce))
+        #         x_reduce = torch.exp(lse_reduce - lse_new) * x_reduce + torch.exp(
+        #             lse_block - lse_new) * x_block
+        #         lse_reduce = lse_new
+        #     x = x_reduce.type_as(x)
+        #     print("x.shape final", x.shape)
+
         # v proj
         if self.mla_weight_dtype == torch.bfloat16:
             x = torch.einsum("shc,hdc->shd", x, wkv_b[:, -self.v_head_dim:])
@@ -1241,10 +1329,16 @@ class VanillaMLA(nn.Module):
         assert len(cache_indices) == attn_metadata.seq_lens.nelement()
 
         # Ulysses preprocess
+        if getattr(self, 'count', None) is None:
+            self.count = 0
+        # if self.count % 4 == 0:
+        # import pdb;pdb.set_trace()
+        self.count += 1
 
         offset = 0
         attn_outputs = []
         for i, seq_len in enumerate(attn_metadata.seq_lens):
+            # allGather for gen, 先确保正确性，后续优化overlap
             single_hidden_state = hidden_states[offset:offset + seq_len, :]
             past_seen_token = past_seen_tokens[i]
             cache_idx = cache_indices[i]
