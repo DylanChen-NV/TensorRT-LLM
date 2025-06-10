@@ -50,7 +50,9 @@ def run_ulysses_single_rank(rank):
     partial_seq_lens = [(seq_len + parallel_size - 1) // parallel_size for seq_len in seq_lens]
 
     input_tensor = torch.randn(token_num, 1024, dtype=torch.half, device="cuda")
+    # TODO: create buffer inside of OP (not equal size as input_tensor)
     output_tensor = torch.randn(token_num, 1024, dtype=torch.half, device="cuda")
+    # TODO: create buffer inside of OP
     buffer_tensor = torch.randn(token_num, 1024, dtype=torch.half, device="cuda")
 
     host_context_lengths = torch.tensor(seq_lens, dtype=torch.int32)
@@ -74,6 +76,7 @@ def run_ulysses_single_rank(rank):
         "is_preprocess": True,
         "batch_size": batch_size,
     }
+    # context phase
     ulysses_model_params_dict = {
         "head_size": 128,
         "num_heads": 16,
@@ -85,8 +88,32 @@ def run_ulysses_single_rank(rank):
         "is_mla_enable": True,
     }
     from torch.ops import trtllm as trtllmOps
-    output = trtllmOps.ulysses(
+    # preprocess: TP2CP
+    middle_tensor = trtllmOps.ulysses(
         input_tensor,
+        output_tensor,
+        buffer_tensor,
+        host_context_lengths,
+        context_lengths,
+        cu_q_seqlens,
+        cu_cp_partial_seqlens,
+        ulysses_comm_params_dict,
+        ulysses_model_params_dict,
+    )
+
+    ulysses_comm_params_dict = {
+        "tp_size": 1,
+        "tp_rank": 0,
+        "cp_size": parallel_size,
+        "cp_rank": rank,
+        "attn_tp_size": parallel_size,
+        "attn_cp_size": 1,
+        "comm_group": [0, 1],
+        "is_preprocess": True,
+        "batch_size": batch_size,
+    }
+    output = trtllmOps.ulysses(
+        middle_tensor,
         output_tensor,
         buffer_tensor,
         host_context_lengths,
