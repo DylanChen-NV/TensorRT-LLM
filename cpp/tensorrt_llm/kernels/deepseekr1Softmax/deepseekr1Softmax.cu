@@ -89,7 +89,8 @@ inline __device__ float blockReduceSum(float* shared, float val)
 }
 
 template <typename scalar_t, typename acc_scalar_t = float, int num_load_elements = 8>
-__global__ void deepseekr1SoftmaxKernel(scalar_t const* input, scalar_t* output, int rows, int cols)
+__global__ void deepseekr1SoftmaxKernel(
+    scalar_t const* input, scalar_t* output, acc_scalar_t* output_se, int rows, int cols)
 {
     // Shared memory for the reductions - we have at most 64 warps per block.
     __shared__ acc_scalar_t s_max[64], s_sum[64];
@@ -173,10 +174,14 @@ __global__ void deepseekr1SoftmaxKernel(scalar_t const* input, scalar_t* output,
     }
 
     // Perform block-wide sum reduction
-    float sum = blockReduceSum(s_sum, sum2.x + sum2.y);
+    float sum = blockReduceSum(s_sum, sum2.x + sum2.y) + 1e-5f;
+    if (output_se && threadIdx.x == 0)
+    {
+        output_se[row] = sum;
+    }
 
     // Compute softmax and store results using the same loaded values
-    float inv_sum = 1.f / (sum + 1e-5f);
+    float inv_sum = 1.f / sum;
     if (col + num_load_elements - 1 < cols)
     {
         float2 v0 = make_float2(float_vals[0], float_vals[1]);
@@ -216,7 +221,8 @@ __global__ void deepseekr1SoftmaxKernel(scalar_t const* input, scalar_t* output,
 }
 
 template <typename scalar_t, typename accscalar_t>
-__global__ void basicSoftmaxKernel(scalar_t const* input, scalar_t* output, int64_t num_groups, int64_t softmax_size)
+__global__ void basicSoftmaxKernel(
+    scalar_t const* input, scalar_t* output, accscalar_t* output_se, int64_t num_groups, int64_t softmax_size)
 {
     // Shared memory for the reductions - we have at most 64 warps per block
     __shared__ accscalar_t s_max[64], s_sum[64];
@@ -250,19 +256,23 @@ __global__ void basicSoftmaxKernel(scalar_t const* input, scalar_t* output, int6
     }
 
     // Perform block-wide sum reduction
-    sum_val = blockReduceSum(s_sum, sum_val);
+    sum_val = blockReduceSum(s_sum, sum_val) + 1e-5f;
+    if (output_se && threadIdx.x == 0)
+    {
+        output_se[row] = sum_val;
+    }
 
     // Third pass: normalize
     for (int i = col; i < softmax_size; i += blockDim.x)
     {
         accscalar_t val = static_cast<accscalar_t>(output[row * softmax_size + i]);
-        output[row * softmax_size + i] = static_cast<scalar_t>(val / (sum_val + 1e-5f));
+        output[row * softmax_size + i] = static_cast<scalar_t>(val / sum_val);
     }
 }
 
 template <typename scalar_t, typename accscalar_t>
-void launchDeepseekr1SoftmaxKernel(
-    scalar_t const* input, scalar_t* output, int64_t num_groups, int64_t softmax_size, cudaStream_t stream)
+void launchDeepseekr1SoftmaxKernel(scalar_t const* input, scalar_t* output, accscalar_t* output_se, int64_t num_groups,
+    int64_t softmax_size, cudaStream_t stream)
 {
     // Calculate grid and block dimensions
     int grid_size = num_groups;
@@ -272,22 +282,22 @@ void launchDeepseekr1SoftmaxKernel(
     if (softmax_size == 2048)
     {
         deepseekr1SoftmaxKernel<scalar_t, accscalar_t>
-            <<<grid_size, block_size, 0, stream>>>(input, output, num_groups, softmax_size);
+            <<<grid_size, block_size, 0, stream>>>(input, output, output_se, num_groups, softmax_size);
     }
     else
     {
         basicSoftmaxKernel<scalar_t, accscalar_t>
-            <<<grid_size, block_size, 0, stream>>>(input, output, num_groups, softmax_size);
+            <<<grid_size, block_size, 0, stream>>>(input, output, output_se, num_groups, softmax_size);
     }
 }
 
 // Explicit template instantiations for standard floating types
-template void launchDeepseekr1SoftmaxKernel<float, float>(float const*, float*, int64_t, int64_t, cudaStream_t);
+template void launchDeepseekr1SoftmaxKernel<float, float>(float const*, float*, float*, int64_t, int64_t, cudaStream_t);
 // Explicit template instantiations for Half and BFloat16 (using float for accumulation)
-template void launchDeepseekr1SoftmaxKernel<half, float>(half const*, half*, int64_t, int64_t, cudaStream_t);
+template void launchDeepseekr1SoftmaxKernel<half, float>(half const*, half*, float*, int64_t, int64_t, cudaStream_t);
 #ifdef ENABLE_BF16
 template void launchDeepseekr1SoftmaxKernel<__nv_bfloat16, float>(
-    __nv_bfloat16 const*, __nv_bfloat16*, int64_t, int64_t, cudaStream_t);
+    __nv_bfloat16 const*, __nv_bfloat16*, float*, int64_t, int64_t, cudaStream_t);
 #endif
 
 } // namespace deepseekr1_softmax

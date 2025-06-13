@@ -13,7 +13,7 @@ from ..attention_backend import (AttentionInputType, AttentionMetadata,
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import get_model_extra_attrs
@@ -409,6 +409,15 @@ class MLA(nn.Module):
         pp_size = config.mapping.pp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
+        self.flash_decoding = True
+        if self.flash_decoding:
+            self.tp_size = tp_size
+            self.tp_rank = config.mapping.tp_rank
+            self.mapping = config.mapping
+            if config.mapping.enable_attention_dp:
+                # TBD
+                self.tp_size = 1
+                self.tp_rank = 0
 
         mapping = Mapping(
             world_size=tp_size * pp_size,
@@ -790,9 +799,33 @@ class MLA(nn.Module):
         k_pe = latent_cache[..., -self.qk_rope_head_dim:]
         # k_pe = k_pe.squeeze(1)
 
+        # flash decoding A:
+        # v1[done]: allgather q_nope and q_pe
+        # v2: overlap with computation / combine q_nope and q_pe
+        if self.flash_decoding:
+            q_nope = allgather(q_nope.view(seqlen, self.num_heads,
+                                           self.kv_lora_rank),
+                               self.mapping,
+                               dim=1)
+            q_pe = allgather(q_pe.view(seqlen, self.num_heads,
+                                       self.qk_rope_head_dim),
+                             self.mapping,
+                             dim=1)
+
         # update kv cache
         kv_states, pe_states = self._single_request_update_kv_cache(
             kv, k_pe.squeeze(1), kv_cache_tensor, cache_idx, start_pos, end_pos)
+
+        # flash decoding B
+        # v1[done]: kv/pe directly split
+        # v2: save partial kv
+        if self.flash_decoding:
+            part = end_pos // self.tp_size
+            sp_start = part * self.tp_rank
+            sp_end = part * (self.tp_rank +
+                             1) if self.tp_rank + 1 < self.tp_size else end_pos
+            kv_states = kv_states[sp_start:sp_end, :]
+            pe_states = pe_states[sp_start:sp_end, :]
 
         # attention
         # scores1 = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
@@ -800,6 +833,7 @@ class MLA(nn.Module):
         # if mask is not None:
         #     scores1 += mask.unsqueeze(1)
         # scores = scores1.softmax(dim=-1, dtype=torch.float32).type_as(single_q)
+
         scores11 = torch.einsum("shc,tc->sht", q_nope, kv_states)
         scores12 = torch.einsum("shr,tr->sht", q_pe, pe_states)
         scores1 = scores11 + scores12
@@ -808,10 +842,46 @@ class MLA(nn.Module):
             scores1_scaled += mask.unsqueeze(1)
         # scores1_scaled_softmax = scores1_scaled.softmax(
         #     dim=-1, dtype=torch.float32).type_as(single_q)
-        scores1_scaled_softmax = torch.ops.trtllm.deepseekr1_softmax(
-            scores1_scaled, dim=-1)
+        # scores1_scaled_softmax = torch.ops.trtllm.deepseekr1_softmax(
+        #     scores1_scaled, dim=-1)
+
+        # flash decoding C
+        # get lse
+        if self.flash_decoding:
+            # # torch lse version
+            # scores_fp32 = scores1_scaled.float()
+            # lse = torch.logsumexp(scores_fp32, dim=-1, keepdim=True)
+            # scores1_scaled_softmax = torch.exp(scores_fp32 - lse).type_as(single_q)
+            scores1_scaled_softmax, se = torch.ops.trtllm.deepseekr1_softmax_with_se(
+                scores1_scaled, dim=-1)
+            se = se.view(-1, self.num_heads * self.tp_size, 1)
+        else:
+            scores1_scaled_softmax = torch.ops.trtllm.deepseekr1_softmax(
+                scores1_scaled, dim=-1)
+
         x = torch.einsum("sht,tc->shc", scores1_scaled_softmax, kv_states)
-        # pdb.set_trace()
+        # flash decoding D
+        # do reduction
+        if self.flash_decoding:
+            # v1: all gather + split
+            # v2: all2all
+            head_start = self.num_heads * self.tp_rank
+            head_end = head_start + self.num_heads
+            x_blocks = allgather(x, self.mapping,
+                                 dim=0).float().view(self.tp_size, *x.shape)
+            se_blocks = allgather(se, self.mapping,
+                                  dim=0).view(self.tp_size, *se.shape)
+            x_reduce = x_blocks[0]
+            se_reduce = se_blocks[0]
+            for i in range(1, self.tp_size):
+                x_block = x_blocks[i]
+                se_block = se_blocks[i]
+                se_new = se_reduce + se_block
+                # TODO: get se_inv from softmax as well to avoid division?
+                x_reduce = x_reduce * se_reduce / se_new + x_block * se_block / se_new
+                se_reduce = se_new
+            x = x_reduce[:, head_start:head_end, ...].type_as(x)
+
         return x
 
     def forward_context_default(
