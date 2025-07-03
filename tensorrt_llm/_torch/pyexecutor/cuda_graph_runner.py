@@ -63,8 +63,7 @@ class DecodingCUDAGraphRunner:
                                         device=device,
                                         dtype=torch.int32)
         self.mrope_position_deltas = torch.zeros(
-            (1, batch_size), device=device,
-            dtype=torch.int32) if use_mrope else None
+            batch_size, device=device, dtype=torch.int32) if use_mrope else None
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
@@ -130,6 +129,9 @@ class DecodingCUDAGraphRunner:
         seqlen = input_ids.shape[0]
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
+        if "mrope_position_deltas" in inputs:
+            self.mrope_position_deltas[:self.batch_size].copy_(
+                inputs["mrope_position_deltas"])
 
         assert self._output is not None and self._graph is not None
         self._graph.replay()
