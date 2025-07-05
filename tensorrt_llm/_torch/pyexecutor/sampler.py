@@ -337,9 +337,10 @@ class TorchSampler(Sampler):
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
-        seq_lens = state.host.seq_lens.tolist()
-        seq_lens_acc = [0] + seq_lens
-        seq_lens_acc = list(accumulate(seq_lens_acc))
+        if state.host.seq_lens is not None:
+            seq_lens = state.host.seq_lens.tolist()
+            seq_lens_acc = [0] + seq_lens
+            seq_lens_acc = list(accumulate(seq_lens_acc))
 
         # Assume the order of requests are the same as model inputs
         seq_lens_idx = 0
@@ -431,7 +432,7 @@ class TorchSampler(Sampler):
                                log_probs=log_probs_host,
                                logits=gen_logits_host,
                                hidden_states=gen_logits_host,
-                               seq_lens=model_outputs["seq_lens"]),
+                               seq_lens=model_outputs.get("seq_lens", None)),
                            sampler_event=sampler_event)
 
     @staticmethod
