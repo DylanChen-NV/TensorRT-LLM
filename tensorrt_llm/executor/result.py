@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from .postproc_worker import PostprocParams, PostprocWorker
     from .request import GenerationRequest
 
+import os
+
 __all__ = [
     "CompletionOutput",
     "GenerationResultBase",
@@ -140,6 +142,8 @@ class GenerationResultBase:
                  sampling_params: SamplingParams,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
+        self.return_hidden_states = os.getenv("RETURN_HIDDEN_STATES",
+                                              default=None)
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
@@ -230,8 +234,12 @@ class GenerationResultBase:
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 assert len(output.logprobs) == output.length
         if response_tensors.generation_logits is not None:
-            output.generation_logits = response_tensors.generation_logits[
-                src_idx, :output.length]
+            if not self.return_hidden_states:
+                output.generation_logits = response_tensors.generation_logits[
+                    src_idx, :output.length]
+            else:
+                output.generation_logits = response_tensors.generation_logits[
+                    src_idx, :]
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
         # be marked as cancelled.

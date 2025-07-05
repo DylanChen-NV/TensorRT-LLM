@@ -485,7 +485,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
             mrope_config=mrope_config)
-        logger.debug(f'output shape: {output_prob.shape}')
+        logger.debug(f'output shape: {output_prob[0].shape}')
         return output_prob
 
 

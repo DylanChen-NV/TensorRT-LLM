@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -151,12 +152,21 @@ class PyResult:
                  return_context_logits: bool = False,
                  return_generation_logits: bool = False,
                  exclude_last_generation_logits: bool = False):
+        self.return_hidden_states = os.getenv("RETURN_HIDDEN_STATES",
+                                              default=None)
         self._streaming = streaming
         self._context_logits = LogitsStorage(
             prompt_len, use_device_memory) if return_context_logits else None
-        self._generation_logits = LogitsStorage(
-            max_new_tokens, use_device_memory, exclude_last_generation_logits
-        ) if return_generation_logits else None
+        if self.return_hidden_states:
+            self._generation_logits = LogitsStorage(
+                prompt_len + max_new_tokens, use_device_memory,
+                exclude_last_generation_logits
+            ) if return_generation_logits else None
+        else:
+            self._generation_logits = LogitsStorage(
+                max_new_tokens, use_device_memory,
+                exclude_last_generation_logits
+            ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
 
     def append_context_logits(self, context_logits: torch.Tensor):

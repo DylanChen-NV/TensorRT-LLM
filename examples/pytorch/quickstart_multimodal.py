@@ -102,6 +102,11 @@ def main():
         prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        if args.return_generation_logits:
+            print(
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+            )
+            print(output.outputs[0].generation_logits.shape)
 
 
 if __name__ == "__main__":

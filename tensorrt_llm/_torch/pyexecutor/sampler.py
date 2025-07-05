@@ -1,6 +1,8 @@
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import Literal
 
 import torch
@@ -33,6 +35,8 @@ class SampleStateTensors:
     new_tokens: torch.Tensor
     logits: torch.Tensor | None = None
     log_probs: torch.Tensor | None = None
+    hidden_states: torch.Tensor | None = None
+    seq_lens: list[int] | None = None
 
     def values(self):
         return vars(self).values()
@@ -222,6 +226,8 @@ class TorchSampler(Sampler):
         self.max_tokens = args.max_draft_tokens + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
+        self.return_hidden_states = os.getenv("RETURN_HIDDEN_STATES",
+                                              default=None)
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -277,10 +283,25 @@ class TorchSampler(Sampler):
 
         return False
 
-    def handle_logits(self, request: LlmRequest, state: SampleState, *,
-                      beam: int, count: int):
+    def handle_logits(self,
+                      request: LlmRequest,
+                      state: SampleState,
+                      *,
+                      beam: int,
+                      count: int,
+                      start: int = 0):
         current_slice = slice(0, count), request.seq_slot, beam
-        if request.py_return_generation_logits:
+        if self.return_hidden_states:
+            current_slice_hidden_states = slice(start, start + count)
+            # print("debug current_slice_hidden_states", current_slice_hidden_states)
+        # Append results
+        if request.py_return_generation_logits and self.return_hidden_states:
+            assert state.host.hidden_states is not None
+            current_hidden_states = state.host.hidden_states[
+                current_slice_hidden_states]
+            # print("debug current_hidden_states", current_hidden_states[:,0].tolist())
+            request.py_result.append_generation_logits(current_hidden_states)
+        elif request.py_return_generation_logits:
             assert state.host.logits is not None
             current_logits = state.host.logits[current_slice]
             request.py_result.append_generation_logits(current_logits)
@@ -316,13 +337,26 @@ class TorchSampler(Sampler):
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
+        seq_lens = state.host.seq_lens.tolist()
+        seq_lens_acc = [0] + seq_lens
+        seq_lens_acc = list(accumulate(seq_lens_acc))
 
+        # Assume the order of requests are the same as model inputs
+        seq_lens_idx = 0
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
             new_token = add_token(req, new_tokens, beam=self.BEAM)
             stop = self._handle_stop_criteria(req, new_token, beam=self.BEAM)
-            self.handle_logits(req, state, beam=self.BEAM, count=1)
+            if self.return_hidden_states:
+                self.handle_logits(req,
+                                   state,
+                                   beam=self.BEAM,
+                                   count=req.py_prompt_len,
+                                   start=seq_lens_acc[seq_lens_idx])
+                seq_lens_idx += 1
+            else:
+                self.handle_logits(req, state, beam=self.BEAM, count=1)
             req.py_decoding_iter += 1
 
         for req in state.scheduled_requests.generation_requests:
@@ -337,7 +371,15 @@ class TorchSampler(Sampler):
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
                 processed += num_accepted
-            self.handle_logits(req, state, beam=self.BEAM, count=processed)
+            if self.return_hidden_states:
+                self.handle_logits(req,
+                                   state,
+                                   beam=self.BEAM,
+                                   count=processed,
+                                   start=seq_lens_acc[seq_lens_idx])
+                seq_lens_idx += 1
+            else:
+                self.handle_logits(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
 
     def log_probs_host(self, requests: Iterable[LlmRequest]):
@@ -351,19 +393,29 @@ class TorchSampler(Sampler):
 
     def gen_logits_host(self, requests: Iterable[LlmRequest], vocab_size: int):
         if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, self.num_seq_slots,
-                                self.MAX_BEAM_WIDTH, vocab_size),
-                               device="cpu",
-                               pin_memory=True)
+            if not self.return_hidden_states:
+                return torch.empty((self.max_tokens, self.num_seq_slots,
+                                    self.MAX_BEAM_WIDTH, vocab_size),
+                                   device="cpu",
+                                   pin_memory=True)
+            else:
+                return torch.empty((self.max_seq_len, vocab_size),
+                                   device="cpu",
+                                   pin_memory=True)
         return None
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
-        vocab_size = model_outputs["logits"].shape[-1]
         log_probs_host = self.log_probs_host(requests)
-        gen_logits_host = self.gen_logits_host(requests, vocab_size)
+        if not self.return_hidden_states:
+            vocab_size = model_outputs["logits"].shape[-1]
+            gen_logits_host = self.gen_logits_host(requests, vocab_size)
+        else:
+            hidden_size = model_outputs["hidden_states"].shape[-1]
+            gen_logits_host = self.gen_logits_host(requests, hidden_size)
+
         self._process_requests(requests,
                                model_outputs,
                                new_tokens,
@@ -374,9 +426,12 @@ class TorchSampler(Sampler):
         sampler_event.record()
         return SampleState(scheduled_requests=scheduled_requests,
                            device=SampleStateTensors(new_tokens=new_tokens),
-                           host=SampleStateTensors(new_tokens=new_tokens_host,
-                                                   log_probs=log_probs_host,
-                                                   logits=gen_logits_host),
+                           host=SampleStateTensors(
+                               new_tokens=new_tokens_host,
+                               log_probs=log_probs_host,
+                               logits=gen_logits_host,
+                               hidden_states=gen_logits_host,
+                               seq_lens=model_outputs["seq_lens"]),
                            sampler_event=sampler_event)
 
     @staticmethod
@@ -395,6 +450,7 @@ class TorchSampler(Sampler):
         beam_width = self.MAX_BEAM_WIDTH
         beam = self.BEAM
         raw_logits = model_outputs["logits"]
+        raw_hidden_states = model_outputs.get("hidden_states", None)
         num_steps = [1 + len(req.py_draft_tokens) for req in requests]
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
@@ -429,6 +485,10 @@ class TorchSampler(Sampler):
             self.append_eagle3(batched_next_tokens, model_outputs)
 
         offset = 0
+        if gen_logits_host is not None and self.return_hidden_states:
+            hidden_states_slice = slice(0, raw_hidden_states.shape[0])
+            gen_logits_host[hidden_states_slice].copy_(raw_hidden_states,
+                                                       non_blocking=True)
         for strategy, slot, steps in zip(strategies, seq_slots, num_steps):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
@@ -440,7 +500,9 @@ class TorchSampler(Sampler):
             current_slice = slice(0, steps), slot, beam
             new_tokens[current_slice] = next_tokens
             if gen_logits_host is not None:
-                gen_logits_host[current_slice].copy_(logits, non_blocking=True)
+                if not self.return_hidden_states:
+                    gen_logits_host[current_slice].copy_(logits,
+                                                         non_blocking=True)
             if log_probs_host is not None:
                 assert beam == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
                 token_probs = torch.gather(

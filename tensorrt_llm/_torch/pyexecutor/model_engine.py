@@ -336,6 +336,8 @@ class PyTorchModelEngine(ModelEngine):
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
     ):
+        self.return_hidden_states = os.getenv("RETURN_HIDDEN_STATES",
+                                              default=None)
         self.ub_buffers = None
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
@@ -2122,6 +2124,13 @@ class PyTorchModelEngine(ModelEngine):
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
+        if self.return_hidden_states:
+            assert gather_ids is None
+            return {
+                'logits': logits[0],
+                'hidden_states': logits[1],
+                'seq_lens': logits[2]
+            }
         if gather_ids is not None:
             return {'logits': logits[gather_ids]}
         else:
