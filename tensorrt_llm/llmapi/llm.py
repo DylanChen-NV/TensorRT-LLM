@@ -293,7 +293,7 @@ class BaseLLM:
             "_postproc_params":
             None
         } for i, request_inputs in enumerate(inputs)]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures_preprocess = {}
             for task_id, task_data in enumerate(tasks_data):
                 task = executor.submit(

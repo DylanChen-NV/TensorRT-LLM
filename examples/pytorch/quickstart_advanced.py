@@ -230,6 +230,7 @@ def setup_llm(args):
         top_p=args.top_p,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
+        end_id=-1,
         logprobs=args.logprobs)
     return llm, sampling_params
 

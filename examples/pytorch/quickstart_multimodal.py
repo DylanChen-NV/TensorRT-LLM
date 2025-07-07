@@ -8,15 +8,17 @@ from tensorrt_llm.inputs import (ALL_SUPPORTED_MULTIMODAL_MODELS,
                                  default_multimodal_input_loader)
 
 example_images = [
-    "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
-]
+    "imgs/600_600.jpeg",
+    #"https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
+    #"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+    #"https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+] * 64 * 4
 example_image_prompts = [
-    "Describe the natural environment in the image.",
-    "Describe the object and the weather condition in the image.",
-    "Describe the traffic condition on the road in the image.",
-]
+    "请你尽可能详细的描述这张图片，并生成一段2000字左右的小故事"
+    #"Describe the natural environment in the image.",
+    #"Describe the object and the weather condition in the image.",
+    #"Describe the traffic condition on the road in the image.",
+] * len(example_images)
 example_videos = [
     "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
     "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4",
@@ -85,7 +87,7 @@ def main():
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
 
-    device = "cuda"
+    device = "cpu"
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=llm._hf_model_dir,
                                              model_type=model_type,
@@ -96,12 +98,17 @@ def main():
                                              num_frames=args.num_frames,
                                              device=device)
 
+    import time
+    start = time.time()
     outputs = llm.generate(inputs, sampling_params)
+    elapsed = time.time() - start
+    print("Total latency: ", elapsed, ", QPS: ", len(example_images) / elapsed)
 
     for i, output in enumerate(outputs):
         prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        break
 
 
 if __name__ == "__main__":

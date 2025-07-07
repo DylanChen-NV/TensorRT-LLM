@@ -1,4 +1,5 @@
 import copy
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -18,6 +19,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
 
+DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+
 
 class Qwen2VLInputProcessorBase(InputProcessor):
 
@@ -34,13 +37,17 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
 
-        # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
-        model = self.get_model_class().from_pretrained(
-            model_path,
-            torch_dtype=model_config.torch_dtype,
-            attn_implementation='flash_attention_2')
-        self.device = 'cuda'
-        self.visual = model.visual.to(self.device)
+        if DISAGG:
+            self.device = 'cuda'
+            # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
+            model = self.get_model_class().from_pretrained(
+                model_path,
+                torch_dtype=model_config.torch_dtype,
+                attn_implementation='flash_attention_2')
+            self.visual = model.visual.to(self.device)
+        else:
+            self.device = 'cpu'
+            self.model_dtype = model_config.torch_dtype
         self._post_init_()
 
     @classmethod
@@ -288,20 +295,32 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  pixel_values_videos: torch.Tensor,
                  image_grid_thw: torch.Tensor,
                  video_grid_thw: torch.Tensor) -> torch.Tensor:
-        embeds = []
+        if DISAGG:
+            embeds = []
 
-        if pixel_values is not None:
-            pixel_values = pixel_values.to(self.visual.dtype)
-            embeds.append(self.visual(pixel_values, grid_thw=image_grid_thw))
+            if pixel_values is not None:
+                pixel_values = pixel_values.to(self.visual.dtype)
+                embeds.append(self.visual(pixel_values,
+                                          grid_thw=image_grid_thw))
 
-        if pixel_values_videos is not None:
-            pixel_values_videos = pixel_values_videos.to(self.visual.dtype)
-            embeds.append(
-                self.visual(pixel_values_videos, grid_thw=video_grid_thw))
+            if pixel_values_videos is not None:
+                pixel_values_videos = pixel_values_videos.to(self.visual.dtype)
+                embeds.append(
+                    self.visual(pixel_values_videos, grid_thw=video_grid_thw))
 
-        if embeds:
-            return torch.cat(embeds, dim=1)
-        return None
+            if embeds:
+                return torch.cat(embeds, dim=1)
+            return None
+        else:
+            # TODO: only support image for now
+            if pixel_values is not None:
+                pixel_values = pixel_values.to(self.model_dtype)
+                new_shape = image_grid_thw[0].tolist() + [pixel_values.shape[1]]
+                return pixel_values.view(new_shape)  #, image_grid_thw
+            return None
+
+            # if pixel_values_videos is not None:
+            #     pixel_values_videos = pixel_values_videos.to(self.model_dtype)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         # NOTE: Qwen2-VL's input processor is doing all the work for fusing input_ids with mm_tokens. So, we just replace mm_tokens with expanded out-of-vocab ids
@@ -420,14 +439,29 @@ class Qwen2VLModelBase(PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
+        self.model_dtype = getattr(config, "torch_dtype", torch.float16)
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
+        if not DISAGG:
+            # TODO: remove hard code
+            model_path = "/llm-models/Qwen2.5-VL-3B-Instruct/"
+            # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
+            model = self.get_model_class().from_pretrained(
+                model_path,
+                torch_dtype=self.model_dtype,
+                attn_implementation='flash_attention_2')
+            self.visual = model.visual.to("cuda")
+            self.vision_spatial_merge_size_square = model_config.pretrained_config.vision_config.spatial_merge_size**2
+
         self.vocab_size = config.vocab_size
-        self.model_dtype = getattr(config, "torch_dtype", torch.float16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")
         self.post_config()
         self.is_loaded = True
+
+    @classmethod
+    def get_model_class(cls) -> type[PreTrainedModel]:
+        raise NotImplementedError()
 
     def load_weights(self, weights):
         self.llm.load_weights(weights)
@@ -458,7 +492,27 @@ class Qwen2VLModelBase(PreTrainedModel):
             f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
         )
 
-        mm_embed = kwargs.get("multi_modal_data", [])
+        if DISAGG:
+            mm_embed = kwargs.get("multi_modal_data", [])
+        else:
+            mm_embed = []
+            mm_features = kwargs.get("multi_modal_data", [])
+            if isinstance(mm_features, list) and len(mm_features) > 0:
+                visual_input_list = []
+                grid_thw_list = []
+                mm_lens = []
+                for mm_feature in mm_features:
+                    grid_thw_list.append(mm_feature.shape[:3])
+                    mm_feature = mm_feature.view(-1, mm_feature.shape[-1])
+                    visual_input_list.append(mm_feature)
+                    mm_lens.append(mm_feature.shape[0] //
+                                   self.vision_spatial_merge_size_square)
+                visual_input = torch.cat(visual_input_list, dim=0)
+                grid_thw = torch.tensor(grid_thw_list,
+                                        dtype=torch.int32,
+                                        device=self.device).view(-1, 3)
+                mm_feature = self.visual(visual_input, grid_thw=grid_thw)
+                mm_embed = torch.split(mm_feature, mm_lens, dim=0)
 
         error_msg = "Number of multimodal features (if provided) should be equal to number of context requests"
         assert mm_embed == [] or len(
@@ -496,10 +550,24 @@ class Qwen2VLModelBase(PreTrainedModel):
 @register_auto_model("Qwen2VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessor, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
-    pass
+
+    @classmethod
+    def get_model_class(cls):
+        return Qwen2VLForConditionalGeneration
+
+    # @classmethod
+    # def get_vision_model_class(cls):
+    #     return Qwen2_VisionTransformerPretrainedModel
 
 
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(Qwen2_5_VLInputProcessor, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):
-    pass
+
+    @classmethod
+    def get_model_class(cls):
+        return Qwen2_5_VLForConditionalGeneration
+
+    # @classmethod
+    # def get_vision_model_class(cls):
+    #     return Qwen2_5_VisionTransformerPretrainedModel
