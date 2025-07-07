@@ -1017,8 +1017,11 @@ class PyTorchModelEngine(ModelEngine):
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
             try:
+                build_kwargs = {}
+                build_kwargs['model_path'] = str(checkpoint_dir)
                 with MetaInitMode():
-                    model = AutoModelForCausalLM.from_config(config)
+                    model = AutoModelForCausalLM.from_config(
+                        config, **build_kwargs)
 
                 memo = dict()
 
@@ -1035,7 +1038,7 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info(
                     f"Fallback to regular model init: {traceback.format_exc(limit=1)}\n"
                 )
-                model = AutoModelForCausalLM.from_config(config)
+                model = AutoModelForCausalLM.from_config(config, **build_kwargs)
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)

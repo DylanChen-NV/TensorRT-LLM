@@ -9,9 +9,8 @@ from .modeling_utils import (MODEL_CLASS_MAPPING, DecoderModelForCausalLM,
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
 
     @staticmethod
-    def from_config(
-        config: ModelConfig[TConfig],
-    ) -> DecoderModelForCausalLM[TModel, TConfig]:
+    def from_config(config: ModelConfig[TConfig],
+                    **kwargs) -> DecoderModelForCausalLM[TModel, TConfig]:
         model_arch = config.pretrained_config.architectures[0]
         # Hack to detect eagle3 checkpoints. TODO: should we provide
         # our own checkpoints with the correct arch? It would let us
@@ -32,6 +31,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             config._frozen = True
         extra_attrs = {}
         with model_extra_attrs(extra_attrs):
-            model = cls(config)
+            model = cls(config, **kwargs)
         model.extra_attrs = extra_attrs
         return model

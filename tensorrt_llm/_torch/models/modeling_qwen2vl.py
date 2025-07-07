@@ -444,14 +444,19 @@ class Qwen2VLModelBase(PreTrainedModel):
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
         if not DISAGG:
-            # TODO: remove hard code
-            model_path = "/llm-models/Qwen2.5-VL-3B-Instruct/"
+            model_path = kwargs.get('model_path', '')
             # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
             model = self.get_model_class().from_pretrained(
                 model_path,
                 torch_dtype=self.model_dtype,
                 attn_implementation='flash_attention_2')
             self.visual = model.visual.to("cuda")
+
+            # maybe better, but not working
+            # model = self.get_model_class()(model_config.pretrained_config)
+            # self.visual = model.visual.to(self.model_dtype).to("cuda")
+            # import pdb;pdb.set_trace()
+
             self.vision_spatial_merge_size_square = model_config.pretrained_config.vision_config.spatial_merge_size**2
 
         self.vocab_size = config.vocab_size
