@@ -1169,7 +1169,10 @@ class PyExecutor:
         payloads = (new_requests, py_request_objects)
 
         if not self.dist.has_pp:
-            return self.dist.broadcast(payloads, root=0)
+            if self.dist.mapping.world_size > 1:
+                return self.dist.broadcast(payloads, root=0)
+            else:
+                return payloads
 
         # broadcast within first tp group before send/recv chain to other tp groups
         if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
