@@ -233,6 +233,7 @@ def setup_llm(args):
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
         n=args.max_beam_width,
+        end_id=-1,
         use_beam_search=args.max_beam_width > 1)
     return llm, sampling_params
 
