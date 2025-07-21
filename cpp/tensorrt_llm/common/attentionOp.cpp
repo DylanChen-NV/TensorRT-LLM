@@ -917,11 +917,49 @@ int AttentionOp::mlaGeneration(
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     params.cache_type = (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
-    auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
+    KVBlockArray kv_cache_buffer;
+    const char* flash_decoding = std::getenv("FLASH_DECODING");
+    if (!flash_decoding || std::string(flash_decoding) == "0")
+    {
+    // auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
+    kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
         sizePerToken, generation_params.cyclic_attention_window_size,
         generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
+    }
+    else
+    {
+        // TODO: hard code
+        /////////////
+        // params->cache_type = cache_type;
+        // params->cu_q_seqlens = cu_q_seqlens;
+        // params->quant_scale_kv = params.kv_scale_orig_quant;
+        TLLM_CHECK_WITH_INFO(params.context_paged_kv_ptr != nullptr,
+            "Paged kv cache is not set for MLA context kernel");
+        TLLM_CHECK_WITH_INFO(params.context_kv_cache_block_offsets_ptr != nullptr,
+            "Paged kv cache block offsets is not set for MLA context kernel");
+        // build another KVBlockArray for MLA context kernel to read paged kv cache, which is built by the
+        // PyTorch backend assume the dtype of paged kv cache is the same as the T
+        // auto const elemSize = sizeof(T);
+        // auto const headSize = params->meta.qk_nope_head_dim + params->meta.qk_rope_head_dim;
+        // mNumKVHeads is 1 for writing, we use mNumHeads for reading paged kv cache
+        // auto sizePerToken = mNumHeads * headSize * elemSize;
+        auto maxBlocksPerSeq = generation_params.max_blocks_per_sequence;
+        // TLLM_LOG_DEBUG(
+        //     "AttentionOp building KVBlockArray for MLA context kernel, elemSize: %d, headSize: %d, mNumHeads: "
+        //     "%d, sizePerToken: %d, batchSize: %d, maxBlocksPerSeq: %d, tokensPerBlock: %d, maxAttentionWindow: "
+        //     "%d, "
+        //     "sinkTokenLen: %d, canUseOneMoreBlock: %d",
+        //     elemSize, headSize, mNumHeads, sizePerToken, params.batch_size, maxBlocksPerSeq, mTokensPerBlock,
+        //     params.cyclic_attention_window_size, params.sink_token_length, params.can_use_one_more_block);
+        kv_cache_buffer = KVBlockArray(batch_beam, maxBlocksPerSeq, mTokensPerBlock,
+            sizePerToken, generation_params.cyclic_attention_window_size, generation_params.max_cyclic_attention_window_size,
+            generation_params.sink_token_length, generation_params.can_use_one_more_block, params.context_paged_kv_ptr,
+            nullptr,
+            static_cast<KVBlockArray::DataType*>(params.context_kv_cache_block_offsets_ptr));
+        /////////////
+    }
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
@@ -961,8 +999,161 @@ int AttentionOp::mlaGeneration(
     params.host_bmm1_scale
         = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
 
+    if (!flash_decoding || std::string(flash_decoding) == "0")
+    {
     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
     sync_check_cuda_error(stream);
+    }
+    
+    
+    static int printCnt = 0;
+    printCnt++;
+    printf("czq printCnt=%d\n", printCnt);
+
+    // if (mCpRank == 0 && mTpRank == 0)
+    {
+        if (printCnt % 30 == 1)
+        {
+            const int bufSize = 1*32*576;
+            const int line = 1*576;
+            const int num = bufSize / line;
+            std::vector<T> host_buf(line, 0);
+            printf("czq gen attn input %p", params.attention_input_buf);
+            for (int j=0;j<num;++j)
+            {
+                sync_check_cuda_error(stream);
+                cudaMemcpyAsync(host_buf.data(), reinterpret_cast<T*>(params.attention_input_buf) + j * line, line * sizeof(T), cudaMemcpyDeviceToHost, stream);
+                sync_check_cuda_error(stream);
+                for (int i=0;i<host_buf.size();++i)
+                // for (int i=0;i<10;++i)
+                {
+                    if (i % line == 0) printf("\nline%d:", j);
+                    printf("%f ", float(host_buf[i]));
+                }
+            }
+            printf("end \n");
+        }
+    }
+
+    // if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+    {
+        // if (mCpRank == 0 && mTpRank == 0)
+        // using DT = T;
+        using DT = __nv_bfloat16;
+        if (printCnt % 30 == 1)
+        {
+            // note: 一个token指 headNum * headSize
+            // const int bufSize = 16*128;
+            // const int bufSize = getHeadSize(); // headSize
+            const int bufSize = getHeadSize(); // headSize
+            // const int tnum = 353;
+            const int tnum = 16;
+            const int bnum = tnum / kv_cache_buffer.mTokensPerBlock;
+            const int linenum = tnum * mNumKVHeads; // headNum
+            printf("czq bufSize=%d, tnum=%d, bnum=%d, linenum=%d\n", bufSize, tnum, bnum, linenum);
+            printf("czq BPB=%d, TPB=%d, TPBL=%d\n"
+            , int(kv_cache_buffer.mBytesPerBlock)
+            , int(kv_cache_buffer.mTokensPerBlock)
+            , int(kv_cache_buffer.mTokensPerBlockLog2)
+            );
+            DT* host_buf = new DT[bufSize];
+            printf("czq context cached K \n");
+            for (int sid=0; sid < 1; ++sid)
+            {
+                const KVCacheIndex* offsets = kv_cache_buffer.getRowPtr(tensorrt_llm::kernels::KVIdxType::K_IDX, sid);
+                for (int bid=0; bid <= bnum; ++bid)
+                {
+                    // if (tid % kv_cache_buffer.mTokensPerBlock != 0) continue;
+                    // const int tid = bid * kv_cache_buffer.mTokensPerBlock;
+                    KVCacheIndex offset{0};
+                    cudaMemcpyAsync(&offset, offsets + bid, sizeof(KVCacheIndex), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    char* ptr = reinterpret_cast<char*>(kv_cache_buffer.getPoolPtr(offset)) + offset.get() * static_cast<uint64_t>(kv_cache_buffer.mBytesPerBlock);
+                    // printf("czq offset value:%p, %d, %d ptr=%p\n", kv_cache_buffer.getPoolPtr(offset), offset.value, offset.get(), ptr);
+
+                    // block内 headNum, tokenNum, headSize
+                    for (int pid=0; pid < linenum; ++pid)
+                    {
+                        const int tid = pid % tnum;
+                        const int hid = pid / tnum;
+                        char* src = ptr + (tid + hid * kv_cache_buffer.mTokensPerBlock) * bufSize * sizeof(DT);
+                        // std::vector<DT> host_buf(bufSize, 0);
+                        cudaMemcpyAsync(host_buf, src, bufSize * sizeof(DT), cudaMemcpyDeviceToHost, stream);
+                        sync_check_cuda_error(stream);
+                        printf("sid%dbid%dtid%dhid%d@%p:", sid, bid, tid + bid * kv_cache_buffer.mTokensPerBlock, hid, src);
+                        for (int i=0;i<bufSize;++i)
+                        {
+                            printf("%f ", float(host_buf[i]));
+                        }
+                        printf("end \n");
+                    }
+                }
+            }
+            delete[] host_buf;
+        }
+    }
+    {
+        // if (mCpRank == 0 && mTpRank == 0)
+        // using DT = T;
+        using DT = __nv_bfloat16;
+        if (printCnt % 30 == 1)
+        {
+            // note: 一个token指 headNum * headSize
+            // const int bufSize = 16*128;
+            // const int bufSize = getHeadSize(); // headSize
+            const int bufSize = getHeadSize(); // headSize
+            // const int tnum = 353;
+            const int tnum = 16;
+            const int bnum = tnum / kv_cache_buffer.mTokensPerBlock;
+            const int linenum = tnum * mNumKVHeads; // headNum
+            printf("czq bufSize=%d, tnum=%d, bnum=%d, linenum=%d\n", bufSize, tnum, bnum, linenum);
+            printf("czq BPB=%d, TPB=%d, TPBL=%d\n"
+            , int(kv_cache_buffer.mBytesPerBlock)
+            , int(kv_cache_buffer.mTokensPerBlock)
+            , int(kv_cache_buffer.mTokensPerBlockLog2)
+            );
+            DT* host_buf = new DT[bufSize];
+            printf("czq context cached V \n");
+            for (int sid=0; sid < 1; ++sid)
+            {
+                const KVCacheIndex* offsets = kv_cache_buffer.getRowPtr(tensorrt_llm::kernels::KVIdxType::V_IDX, sid);
+                for (int bid=0; bid <= bnum; ++bid)
+                {
+                    // if (tid % kv_cache_buffer.mTokensPerBlock != 0) continue;
+                    // const int tid = bid * kv_cache_buffer.mTokensPerBlock;
+                    KVCacheIndex offset{0};
+                    cudaMemcpyAsync(&offset, offsets + bid, sizeof(KVCacheIndex), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    char* ptr = reinterpret_cast<char*>(kv_cache_buffer.getPoolPtr(offset)) + offset.get() * static_cast<uint64_t>(kv_cache_buffer.mBytesPerBlock);
+                    // printf("czq offset value:%p, %d, %d ptr=%p\n", kv_cache_buffer.getPoolPtr(offset), offset.value, offset.get(), ptr);
+
+                    // block内 headNum, tokenNum, headSize
+                    for (int pid=0; pid < linenum; ++pid)
+                    {
+                        const int tid = pid % tnum;
+                        const int hid = pid / tnum;
+                        char* src = ptr + (tid + hid * kv_cache_buffer.mTokensPerBlock) * bufSize * sizeof(DT);
+                        // std::vector<DT> host_buf(bufSize, 0);
+                        cudaMemcpyAsync(host_buf, src, bufSize * sizeof(DT), cudaMemcpyDeviceToHost, stream);
+                        sync_check_cuda_error(stream);
+                        printf("sid%dbid%dtid%dhid%d@%p:", sid, bid, tid + bid * kv_cache_buffer.mTokensPerBlock, hid, src);
+                        for (int i=0;i<bufSize;++i)
+                        {
+                            printf("%f ", float(host_buf[i]));
+                        }
+                        printf("end \n");
+                    }
+                }
+            }
+            delete[] host_buf;
+        }
+    }
+
+    // if (params.latent_cache)
+    // {
+    //     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
+    //     sync_check_cuda_error(stream);
+    // }
 
     if (generation_params.runtime_perf_knobs)
     {
@@ -1057,6 +1248,31 @@ int AttentionOp::mlaGeneration(
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
+        sync_check_cuda_error(stream);
+
+        {
+            if (printCnt % 30 == 1)
+            {
+                const int bufSize = 1*32*512;
+                const int line = 1*512;
+                const int num = bufSize / line;
+                std::vector<T> host_buf(line, 0);
+                printf("czq gen attn output %p", params.context_buf);
+                for (int j=0;j<num;++j)
+                {
+                    sync_check_cuda_error(stream);
+                    cudaMemcpyAsync(host_buf.data(), reinterpret_cast<T*>(params.context_buf) + j * line, line * sizeof(T), cudaMemcpyDeviceToHost, stream);
+                    sync_check_cuda_error(stream);
+                    for (int i=0;i<host_buf.size();++i)
+                    // for (int i=0;i<10;++i)
+                    {
+                        if (i % line == 0) printf("\nline%d:", j);
+                        printf("%f ", float(host_buf[i]));
+                    }
+                }
+                printf("end \n");
+            }
+        }
         sync_check_cuda_error(stream);
     }
     else if (mUseGenFlashMLA)
@@ -1630,6 +1846,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if not using paged context FMHA
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
+                // if (params.mla_param->latent_cache)
+                // {
+                //     // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if not using paged context FMHA
+                //     invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
+                // }
             }
         }
         else

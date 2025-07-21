@@ -414,7 +414,7 @@ class TrtllmAttentionWrapper:
             output_sf,
             out_dtype,
             self.workspace,
-            self.sequence_length,
+            self.sequence_length,  # generation 改这个
             self.host_past_key_value_lengths,
             self.context_lengths,
             self.host_context_lengths,
@@ -1225,6 +1225,121 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and metadata.num_ctx_cached_tokens > 0
                 and metadata.runtime_features.chunked_prefill)
 
+    def load_paged_kv_cache_for_mla_flash_decoding2(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        out_dtype: torch.dtype,
+        kv_cache_block_offsets,
+        kv_cache_pool_pointers,
+        kv_cache_pool_mapping
+    ) -> torch.Tensor:
+        assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+
+        sink_token_length = 0
+        beam_width = 1
+
+        num_cached_tokens_per_seq = metadata.kv_cache_params.num_cached_tokens_per_seq[-metadata.num_generations:]
+        ctx_cached_token_indptr = torch.cumsum(
+            torch.tensor([0] + num_cached_tokens_per_seq,
+                         dtype=torch.int64, device=torch.cuda.current_device()),
+            dim=0
+            )
+        num_total_cached_tokens = [num + beam_width for num in num_cached_tokens_per_seq]
+        max_gen_kv_len = max(num_total_cached_tokens)
+        total_token_num = sum(num_total_cached_tokens)
+        ctx_kv_indptr = torch.cumsum(
+            torch.tensor([0] + num_total_cached_tokens,
+                         dtype=torch.int64, device=torch.cuda.current_device()),
+            dim=0
+            )
+
+        # assert metadata.max_ctx_kv_len > 0
+        # assert metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens == metadata.host_ctx_kv_indptr[
+        #     metadata.num_contexts]
+        assert max_gen_kv_len > 0
+
+        compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
+            out_dtype,
+            metadata.num_generations,
+            total_token_num, #返回大小 对的
+            max_gen_kv_len,
+            ctx_kv_indptr,
+            kv_cache_block_offsets,
+            kv_cache_block_offsets.cpu(),
+            kv_cache_pool_pointers,
+            kv_cache_pool_mapping,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            self.get_local_layer_idx(metadata),
+            self.mla_params.kv_lora_rank,
+            self.mla_params.qk_rope_head_dim,
+            metadata.kv_cache_manager.tokens_per_block,
+            metadata.kv_cache_manager.max_seq_len,
+            sink_token_length,
+            beam_width,
+            self.wrapper.quant_mode,
+        )
+
+        return compressed_kv, k_pe
+
+    def load_paged_kv_cache_for_mla_flash_decoding(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+
+        sink_token_length = 0
+        beam_width = 1
+
+        num_cached_tokens_per_seq = metadata.kv_cache_params.num_cached_tokens_per_seq[-metadata.num_generations:]
+        ctx_cached_token_indptr = torch.cumsum(
+            torch.tensor([0] + num_cached_tokens_per_seq,
+                         dtype=torch.int64, device=torch.cuda.current_device()),
+            dim=0
+            )
+        num_total_cached_tokens = [num + beam_width for num in num_cached_tokens_per_seq]
+        max_gen_kv_len = max(num_total_cached_tokens)
+        total_token_num = sum(num_total_cached_tokens)
+        ctx_kv_indptr = torch.cumsum(
+            torch.tensor([0] + num_total_cached_tokens,
+                         dtype=torch.int64, device=torch.cuda.current_device()),
+            dim=0
+            )
+
+        # assert metadata.max_ctx_kv_len > 0
+        # assert metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens == metadata.host_ctx_kv_indptr[
+        #     metadata.num_contexts]
+        assert max_gen_kv_len > 0
+
+        compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
+            out_dtype,
+            metadata.num_generations,
+            total_token_num, #返回大小 对的
+            max_gen_kv_len,
+            ctx_kv_indptr,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
+            metadata.kv_cache_manager.kv_cache_pool_pointers,
+            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            self.get_local_layer_idx(metadata),
+            self.mla_params.kv_lora_rank,
+            self.mla_params.qk_rope_head_dim,
+            metadata.kv_cache_manager.tokens_per_block,
+            metadata.kv_cache_manager.max_seq_len,
+            sink_token_length,
+            beam_width,
+            self.wrapper.quant_mode,
+        )
+
+        return compressed_kv, k_pe
+
     def load_paged_kv_cache_for_mla(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -1343,6 +1458,66 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
         return paged_kv_offsets
 
+    def set_chunked_kv_cache_for_mla_flash_decoding(
+        self,
+        paged_kv: torch.Tensor,
+        kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        cu_chunked_seq_len: torch.Tensor,
+        # cached: bool,
+        metadata: TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        assert self.is_mla_enable and self.mla_params is not None
+        # assert self.mla_params.qk_nope_head_dim == self.mla_params.v_head_dim
+        assert metadata.kv_cache_manager is not None
+        assert paged_kv.shape[0] == metadata.num_generations
+        assert paged_kv.is_contiguous()
+
+        kv = kv.contiguous()
+        k_pe = k_pe.contiguous()
+
+        num_generations = metadata.num_generations
+        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+        # if cached:
+        #     # this indptr is the fake.
+        #     cu_seq_len = cu_chunked_seq_len
+        #     max_seq_len = metadata.runtime_features.chunk_size
+        # else:
+        #     cu_seq_len = metadata.ctx_uncached_token_indptr
+        #     max_seq_len = metadata.max_ctx_seq_len
+
+        beam_width = 1
+        num_cached_tokens_per_seq = metadata.kv_cache_params.num_cached_tokens_per_seq[-metadata.num_generations:]
+        # ctx_cached_token_indptr = torch.cumsum(
+        #     torch.tensor([0] + num_cached_tokens_per_seq,
+        #                  dtype=torch.int64, device=torch.cuda.current_device()),
+        #     dim=0
+        #     )
+        num_total_cached_tokens = [num + beam_width for num in num_cached_tokens_per_seq]
+        max_seq_len = max(num_total_cached_tokens)
+        cu_seq_len = torch.cumsum(
+            torch.tensor([0] + num_total_cached_tokens,
+                         dtype=torch.int64, device=torch.cuda.current_device()),
+            dim=0
+            )
+
+        paged_kv_offsets = torch.ops.trtllm.set_chunked_kv_cache_for_mla(
+            paged_kv,
+            kv,
+            k_pe,
+            num_generations,
+            cu_seq_len,
+            1, # self.num_heads,
+            self.mla_params.kv_lora_rank,
+            self.mla_params.qk_rope_head_dim,
+            metadata.kv_cache_manager.tokens_per_block,
+            max_seq_len,
+        )
+
+        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
+        assert paged_kv_offsets.shape == (num_generations, 2, max_block_num)
+        return paged_kv_offsets
+
     def set_chunked_kv_cache_for_mla(
         self,
         paged_kv: torch.Tensor,
@@ -1387,6 +1562,60 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
         return paged_kv_offsets
 
+    def mla_rope_append_paged_kv_assign_q_flash_decoding(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+
+        sink_token_length = 0
+        beam_width = 1
+
+        max_gen_seq_len = beam_width
+
+        num_cached_tokens_per_seq = metadata.kv_cache_params.num_cached_tokens_per_seq[-metadata.num_generations:]
+        ctx_cached_token_indptr = torch.cumsum(
+            torch.tensor([0] + num_cached_tokens_per_seq,
+                         dtype=torch.int64, device=q.device),
+            dim=0
+            )
+        num_total_cached_tokens = [num + beam_width for num in num_cached_tokens_per_seq]
+        ctx_kv_indptr = torch.cumsum(
+            torch.tensor([0] + num_total_cached_tokens,
+                         dtype=torch.int64, device=q.device),
+            dim=0
+            )
+
+        torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
+            q,
+            latent_cache,
+            metadata.num_generations,
+            ctx_cached_token_indptr,
+            ctx_kv_indptr,
+            # None, # to be removed
+            max_gen_seq_len,
+            self.wrapper.rotary_cos_sin,
+            self.num_heads,
+            self.mla_params.qk_nope_head_dim,
+            self.mla_params.qk_rope_head_dim,
+            self.mla_params.kv_lora_rank,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
+            metadata.kv_cache_manager.kv_cache_pool_pointers,
+            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            self.get_local_layer_idx(metadata),
+            metadata.kv_cache_manager.tokens_per_block,
+            metadata.kv_cache_manager.max_seq_len,
+            sink_token_length,
+            beam_width,
+            self.wrapper.quant_mode,
+        )
+
     def mla_rope_append_paged_kv_assign_q(
         self,
         q: torch.Tensor,
@@ -1405,6 +1634,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.num_contexts,
             metadata.ctx_cached_token_indptr,
             metadata.ctx_kv_indptr,
+            metadata.ctx_kv_seq_lens if hasattr(metadata, "ctx_kv_seq_lens") else None,
             metadata.max_ctx_seq_len,
             self.wrapper.rotary_cos_sin,
             self.num_heads,

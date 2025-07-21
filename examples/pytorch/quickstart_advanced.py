@@ -8,9 +8,9 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
 
 example_prompts = [
     "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+#    "The president of the United States is",
+#    "The capital of France is",
+#    "The future of AI is",
 ]
 
 

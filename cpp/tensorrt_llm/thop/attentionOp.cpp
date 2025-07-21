@@ -170,6 +170,26 @@ public:
                 // assume latent_cache has been written to paged kv cache by the PyTorch backend
                 TORCH_CHECK(latent_cache.has_value());
                 mla_params.latent_cache = static_cast<T const*>(latent_cache->data_ptr());
+
+                if (mla_context_paged_kv.has_value())
+                {
+                    // TODO: name TBD
+                    mla_params.context_paged_kv_ptr = mla_context_paged_kv->data_ptr();
+                }
+                if (mla_context_kv_cache_block_offsets.has_value())
+                {
+                    mla_params.context_kv_cache_block_offsets_ptr = mla_context_kv_cache_block_offsets->data_ptr();
+                    mla_params.context_paged_kv_max_blocks_per_seq = mla_context_kv_cache_block_offsets->size(-1);
+                }
+
+                // if (latent_cache.has_value())
+                // {
+                //     mla_params.latent_cache = static_cast<T const*>(latent_cache->data_ptr());
+                // }
+                // else
+                // {
+                //     mla_params.latent_cache = nullptr;
+                // }
             }
             if (!is_context)
             {

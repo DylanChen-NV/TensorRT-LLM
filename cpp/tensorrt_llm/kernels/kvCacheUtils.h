@@ -203,7 +203,7 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
         return headIdx * mTokensPerBlock * dimsPerHead + getLocalIdx(globalTokenIdx) * dimsPerHead + channelIdx;
     }
 
-private:
+// private:
     __host__ __device__ [[nodiscard]] void* getPoolPtr(DataType offset) const
     {
         return offset.isPrimary() ? mPrimaryPoolPtr : mSecondaryPoolPtr;

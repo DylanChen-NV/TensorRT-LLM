@@ -23,7 +23,9 @@ from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
-
+import os
+FLASH_DECODING = os.getenv("FLASH_DECODING", "0")
+czq_idx = 0
 class Attention(nn.Module):
 
     def __init__(
@@ -488,6 +490,8 @@ class MLA(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        self.tp_size = mapping.tp_size
+        self.tp_rank = mapping.tp_rank
 
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
@@ -844,6 +848,126 @@ class MLA(nn.Module):
             q, k, v = qkv, None, None
         return q, k, v
 
+    def forward_context_for_flash_decoding(
+            self,
+            q: torch.Tensor,
+            compressed_kv: torch.Tensor,
+            latent_cache: Optional[torch.Tensor],
+            attn_metadata: AttentionMetadata,
+            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        global czq_idx
+        czq_idx += 1
+        print(f"czq_idx: {czq_idx}")
+        TARGET = 91 #91
+        ##############
+        # 0. context 部分改动只是为了快速得到存部分kv效果，具体改法还需商榷
+
+        # 1. 存全量latent cache 计算全量q_pe k_pe, 主要是为了全量k_pe
+        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+        origin_latent_cache = latent_cache.clone()
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata)
+
+        k_pe = latent_cache[:, -self.qk_rope_head_dim:]
+
+        # print(f"czq rank {self.tp_rank} get origin kv: {latent_cache[:,:512].sum(dim=1)}")
+
+        # if czq_idx == TARGET and self.tp_rank == 0:
+        #     # print(f"full_compressed_kv: {full_compressed_kv.shape}")
+        #     import pdb; pdb.set_trace()
+
+        # if self.rope_fusion:
+        #     # copy full_compressed_kv and full_k_pe from paged kv cache
+        #     full_compressed_kv, k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
+        #         attn_metadata, q.dtype)
+        #     # print(f"czq rank {self.tp_rank} get kv: {full_compressed_kv.sum(dim=1)}")
+        # if czq_idx == TARGET and self.tp_rank == 0:
+        #     # print(f"full_compressed_kv: {full_compressed_kv.shape}")
+        #     import pdb; pdb.set_trace()
+        #     print(f"czq rank {self.tp_rank} get origin kv: {latent_cache[:,:512].sum(dim=1)}")
+
+        ##############重新写入partial latent cache 此处重复操作
+        num_contexts = attn_metadata.num_contexts
+        seq_global_start = attn_metadata.ctx_kv_indptr
+        seq_lens = seq_global_start[1:num_contexts+1] - seq_global_start[0:num_contexts]
+
+        partial_latent_cache_chunks = []
+        parital_latent_cache_chunks_seq_lens = [0]
+        for i, seq_len in enumerate(seq_lens):
+            start = seq_global_start[i]
+            end = start + seq_len
+            partial_latent_cache_chunk = torch.chunk(origin_latent_cache[start:end, ...], self.tp_size)[self.tp_rank]
+            partial_latent_cache_chunks.append(partial_latent_cache_chunk)
+            # parital_latent_cache_chunks_seq_len_acc = parital_latent_cache_chunks_seq_lens[-1] if parital_latent_cache_chunks_seq_lens else 0
+            # parital_latent_cache_chunks_seq_lens.append(partial_latent_cache_chunk.shape[0] + parital_latent_cache_chunks_seq_len_acc)
+            parital_latent_cache_chunks_seq_lens.append(partial_latent_cache_chunk.shape[0] + parital_latent_cache_chunks_seq_lens[-1])
+        latent_cache_chunks_seq_lens = torch.tensor(parital_latent_cache_chunks_seq_lens, dtype=seq_global_start.dtype, device=seq_global_start.device)
+        partial_latent_cache = torch.cat(partial_latent_cache_chunks, dim=0)
+        print(f"czq rank {self.tp_rank} get seq_lens: {seq_lens}")
+        print(f"czq rank {self.tp_rank} get latent_cache_chunks_seq_lens: {latent_cache_chunks_seq_lens}")
+        print(f"czq rank {self.tp_rank} get partial_latent_cache: {partial_latent_cache.shape}")
+
+        # 里面k_pe index可能不对，还是搞一个直接平移拷贝的kernel 或者 在generation中get出来然后slice
+        setattr(attn_metadata, "ctx_kv_seq_lens", latent_cache_chunks_seq_lens)
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(
+            torch.empty_like(q), partial_latent_cache, attn_metadata)
+        delattr(attn_metadata, "ctx_kv_seq_lens")
+
+
+        # # debug
+        # origin_ctx_kv_seq_lens = getattr(attn_metadata, "ctx_kv_indptr")
+        # setattr(attn_metadata, "ctx_kv_indptr", latent_cache_chunks_seq_lens)
+        # full_compressed_kv, k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
+        #     attn_metadata, q.dtype)
+        # setattr(attn_metadata, "ctx_kv_indptr", origin_ctx_kv_seq_lens)
+
+        # print(f"czq rank {self.tp_rank} get kv: {full_compressed_kv.sum(dim=1)}")
+        # if czq_idx == TARGET and self.tp_rank == 0:
+        #     # print(f"full_compressed_kv: {full_compressed_kv.shape}")
+        #     import pdb; pdb.set_trace()
+        ##############
+            
+
+        kv = self.kv_b_proj(compressed_kv)
+        k_nope, v = kv.split(
+            [
+                self.num_heads * self.qk_nope_head_dim,
+                self.num_heads * self.v_head_dim
+            ],
+            -1,
+        )
+
+        k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
+        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
+                                                     self.qk_nope_head_dim)
+        # if self.apply_rotary_emb:
+        if True:
+            k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
+                                                       self.qk_rope_head_dim)
+        k = k.view(-1, self.num_heads * self.qk_head_dim)
+
+        # if czq_idx == TARGET:
+        #     import pdb; pdb.set_trace()
+        # May concat q(including q_pe), k + k_pe, v together
+        q, k, v = self._maybe_concat_qkv(q, k, v)
+
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
+
+        attn_output = self.mha.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=out_scale,
+            output=output,
+        )
+
+        return attn_output
+
     def forward_context_default(
             self,
             q: torch.Tensor,
@@ -1014,6 +1138,27 @@ class MLA(nn.Module):
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
         origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
 
+        # chunk context 问题:
+        #   1. 为啥这里全循环完了，chunk context难道不是全程只能跑一个chunk？
+        #   2. 
+        # MISC:
+        #   1. 必须先正常做完mha（其中先写完整kv，然后fmha kernel需要读paged kv）然后 hack
+        #   2. [TEST0] 写paged kv 和 mha 是解耦的，v0把写paged kv拆到外面，结果对齐，v1只写部分kv
+        #   3. [TEST1] 不如直接每个rank 一个chunk，然后reduce看下结果
+        # flash decoding 做法:
+        # 1. 【先不改】context 做完，用 set_chunked_kv_cache_for_mla 把当前rank的kv chunk顶到最前面
+        #    - 可能的问题：需要改造，set_chunked_kv_cache_for_mla，目前他只支持写到tensor？
+        # 2. generation 
+        #   a. 【先不改】每次需要修改kv len 到实际需要值(考虑到上一次，每个rank都加了新token，这次只挑一个rank+1)
+        #     - kv len怎么改
+        #   a. kv 全存，每个rank读一部分出来（或者全读，然后split）(先把后面走通)
+        #   b. torch allGather q_pe q_nope
+        #   c. 每个rank正常写kv，attentionOp内基本不改
+        #     - 可能的问题：q尺寸不对，kv len怎么给
+        #   d. torch all2all每个rank拿部分head size
+        #     - 第一步可以all gather + split走通
+        #   e. reduce, 用 merge_attention_for_mla
+
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
             # fetch `loop_idx` chunk from kv cache
@@ -1067,7 +1212,7 @@ class MLA(nn.Module):
                 latent_cache=None,
                 out_scale=out_scale,
                 attention_mask=PredefinedAttentionMask.FULL,
-                mla_context_paged_kv=full_kv,
+                mla_context_paged_kv=full_kv, # 新建一个tensor作为primary pool
                 mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
                 output=temp_attn_output,
@@ -1141,20 +1286,242 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # print(f"czq context latent_cache: {latent_cache.shape} \n {latent_cache[:, :512].sum(dim=1)}")
+        # if True:
+        #     return self.forward_context_for_flash_decoding(
+        #         q, compressed_kv, latent_cache, attn_metadata, output)
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
+            # chunked context
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
+                # print("czq 2")
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output)
+            # kv cache reuse
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
+                # print("czq 3")
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
+        # normal
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             attn_metadata, latent_cache, output)
 
     def forward_generation(
+            self,
+            q: torch.Tensor,
+            compressed_kv: torch.Tensor,
+            k_pe: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            latent_cache: Optional[torch.Tensor] = None,
+            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        global FLASH_DECODING
+        if FLASH_DECODING == "1":
+            return self.forward_generation_flash_decoding(q, compressed_kv, k_pe,
+                                              attn_metadata, latent_cache, output)
+        else:
+            return self.forward_generation_default(q, compressed_kv, k_pe,
+                                              attn_metadata, latent_cache, output)
+
+    def forward_generation_flash_decoding(
+            self,
+            q: torch.Tensor,
+            compressed_kv: torch.Tensor,
+            k_pe: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            latent_cache: Optional[torch.Tensor] = None,
+            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+        global czq_idx
+        # czq_idx += 1
+        # print(f"czq_idx: {czq_idx}")
+
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        # A. 更新 q_pe，并全存kv
+        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+        # if czq_idx % 30 == 1:
+        #     import pdb;pdb.set_trace()
+        # qori = q.clone()
+        trtllm_attention.mla_rope_append_paged_kv_assign_q_flash_decoding(
+            q, latent_cache, attn_metadata)
+        # qnopediff = (qori.view(-1,32,192)[:,:,:128]-q.view(-1,32,192)[:,:,:128]).sum()
+        # qpediff = (qori.view(-1,32,192)[:,:,128:]-q.view(-1,32,192)[:,:,128:]).sum()
+        # if czq_idx % 30 == 1:
+        #     print(f"czq latent_cache: {latent_cache.shape} \n {latent_cache[:, :512].sum(dim=1)}")
+        #     import pdb;pdb.set_trace()
+
+        # bs > 1 时会读成别的seq的kv，待排查
+        # 先默认bs==1
+        # TODO 直接load chunked
+        full_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla_flash_decoding(
+            attn_metadata, q.dtype)
+
+        # 先不分chunk直接跑下，看下传kv tensor 进mqa的正确性
+
+        if czq_idx % 30 == 1:
+            # print(f"czq full_compressed_kv: {full_compressed_kv.shape} \n {full_compressed_kv[:, :512].sum(dim=1)}")
+            import pdb;pdb.set_trace()
+
+        max_num_cached_tokens_per_seq = 1 + max(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[-attn_metadata.num_generations:])
+        tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
+        # paged_full_kv = torch.zeros([
+        #     attn_metadata.num_generations, 2,
+        #     (max_num_cached_tokens_per_seq + tokens_per_block - 1) //
+        #     tokens_per_block, 1, tokens_per_block,
+        #     self.kv_lora_rank + self.qk_rope_head_dim
+        # ],
+        #                       dtype=q.dtype,
+        #                       device=q.device)
+
+        paged_full_kv = torch.zeros([
+            attn_metadata.num_generations, 2,
+            (max_num_cached_tokens_per_seq + tokens_per_block - 1) //
+            tokens_per_block * tokens_per_block,
+            self.kv_lora_rank + self.qk_rope_head_dim
+        ],
+                              dtype=q.dtype,
+                              device=q.device)
+
+        if czq_idx % 30 == 1:
+            import pdb;pdb.set_trace()
+        
+        # TODO: 改成用一个kernel
+        # mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla_flash_decoding(
+        #     paged_full_kv,
+        #     full_kv,
+        #     full_k_pe,
+        #     cu_chunked_seq_len=None,
+        #     # cached=False,
+        #     metadata=attn_metadata)
+
+        # padded_size = (max_num_cached_tokens_per_seq + tokens_per_block - 1) // tokens_per_block * tokens_per_block
+
+        # max_num_cached_tokens_per_seq = 1 + max(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[-attn_metadata.num_generations:])
+        num_cached_tokens_cu_ori = 0
+        for i in range(attn_metadata.num_generations):
+            num_cached_tokens = 1 + attn_metadata.kv_cache_params.num_cached_tokens_per_seq[i - attn_metadata.num_generations]
+            num_cached_tokens_cu = num_cached_tokens_cu_ori + num_cached_tokens
+            paged_full_kv[i, 0, :num_cached_tokens, :self.kv_lora_rank] = full_kv[num_cached_tokens_cu_ori:num_cached_tokens_cu, :]
+            paged_full_kv[i, 0, :num_cached_tokens, self.kv_lora_rank:] = full_k_pe[num_cached_tokens_cu_ori:num_cached_tokens_cu, :]
+            paged_full_kv[i, 1, :num_cached_tokens, :self.kv_lora_rank] = full_kv[num_cached_tokens_cu_ori:num_cached_tokens_cu, :]
+            paged_full_kv[i, 1, :num_cached_tokens, self.kv_lora_rank:] = full_k_pe[num_cached_tokens_cu_ori:num_cached_tokens_cu, :]
+            num_cached_tokens_cu_ori = num_cached_tokens_cu
+        # TODO:
+        # v1[done]: 单卡，走通外置kv处理；在不切割kv对齐输出(可能需要打印原版kv看下)
+        # v2: 裸切割kv，实现reduce，对齐输出
+        # v3: 参考mla_rope_append_paged_kv_assign_q_flash_decoding实现切割+只在一个rank写kv
+
+        max_cached_tokens_per_seq = 1 + max(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[-attn_metadata.num_generations:])
+        max_block_num = int((max_cached_tokens_per_seq + attn_metadata.kv_cache_manager.tokens_per_block - 1) / attn_metadata.kv_cache_manager.tokens_per_block)
+        mla_kv_cache_block_offsets = torch.arange(0, attn_metadata.num_generations * 2 * max_block_num, dtype=torch.int32, device=q.device).view(-1, 2, max_block_num)
+
+
+        if czq_idx % 30 == 1:
+            import pdb;pdb.set_trace()
+
+        num_tokens = q.shape[0]
+        q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
+        # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
+        fused_q = torch.empty(
+            [
+                num_tokens, self.num_heads,
+                (self.kv_lora_rank + self.qk_rope_head_dim)
+            ],
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+        if self.k_b_proj_trans.dtype == torch.bfloat16:
+            # [num_heads, num_tokens, self.qk_nope_head_dim]
+            q_nope_t = q_nope.transpose(0, 1)
+            # [num_heads, num_tokens, self.kv_lora_rank]
+            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
+            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
+            # The output of bmm is written directly into fused_q
+            torch.ops.trtllm.bmm_out(q_nope_t,
+                                     self.k_b_proj_trans.transpose(1, 2),
+                                     q_nope_out)
+        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+            # [num_heads, num_tokens, self.kv_lora_rank]
+            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+            fp8_block_scaling_bmm_out(q_nope, self.k_b_proj_trans,
+                                      self.k_b_proj_trans_scale, q_nope_out)
+        else:
+            raise NotImplementedError(
+                f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
+
+        # if self.apply_rotary_emb:
+        fused_q[..., self.kv_lora_rank:] = q_pe
+        fused_q = fused_q.view([
+            num_tokens,
+            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+        ])
+
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+
+        if czq_idx % 30 == 1:
+            import pdb;pdb.set_trace()
+
+        print(f"czq fused_q: {fused_q.shape} \n {fused_q[:, :32]}")
+        torch.cuda.synchronize()
+        attn_out_latent = self.mqa.forward(
+            fused_q,
+            None,
+            None,
+            attn_metadata,
+            attention_input_type=AttentionInputType.generation_only,
+            out_scale=out_scale,
+            latent_cache=latent_cache,  # kvcache and k_pe
+            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            mla_context_paged_kv=paged_full_kv,
+            mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
+            # softmax_stats_tensor=self.temp_softmax_stats_tensor,
+        )
+        torch.cuda.synchronize()
+        # print(f"czq attn_out_latent: {attn_out_latent.shape} \n {attn_out_latent[:, :512].sum(dim=1)}")
+        print(f"czq attn_out_latent: {attn_out_latent.shape} \n {attn_out_latent[:, :32]}")
+        fused_q = None
+
+        assert (attn_out_latent.shape[0] == q.shape[0] and
+                attn_out_latent.shape[1] == self.num_heads * self.kv_lora_rank)
+
+        # [seq, num_heads, kv_lora_rank]
+        attn_out_latent = attn_out_latent.view(
+            [-1, self.num_heads, self.kv_lora_rank])
+
+        # [seq, num_heads * v_head_dim]
+        output = output if output is not None else torch.empty(
+            [num_tokens, self.num_heads * self.v_head_dim],
+            dtype=attn_out_latent.dtype,
+            device=attn_out_latent.device)
+
+        attn_output = output.view([num_tokens, self.num_heads, self.v_head_dim])
+
+        if self.v_b_proj.dtype == torch.bfloat16:
+            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
+            # -> [num_heads, seq, v_head_dim]
+            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                     self.v_b_proj.transpose(1, 2),
+                                     attn_output.transpose(0, 1))
+        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
+            fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
+                                      self.v_b_proj_scale,
+                                      attn_output.transpose(0, 1))
+        else:
+            raise NotImplementedError(
+                f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+
+        return output
+
+    def forward_generation_default(
             self,
             q: torch.Tensor,
             compressed_kv: torch.Tensor,
@@ -1209,6 +1576,8 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
 
+        # print(f"czq fused_q: {fused_q.shape} \n {fused_q[:, ]}")
+        # torch.cuda.synchronize()
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,
@@ -1219,6 +1588,8 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
         )
+        torch.cuda.synchronize()
+        print(f"czq attn_out_latent: {attn_out_latent.shape} \n {attn_out_latent[:, :32]}")
         fused_q = None
 
         assert (attn_out_latent.shape[0] == q.shape[0] and

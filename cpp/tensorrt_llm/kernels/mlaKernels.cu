@@ -762,6 +762,7 @@ __global__ void setPagedKVCacheForMLAKernel(T* output, T const* k_ptr, T const* 
 // latent_cache {total_uncached_tokens, d_k + d_rope}
 template <typename T, typename TCache, int BLOCK_SIZE, int K_DIM, int ROPE_DIM>
 __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T* q_ptr, T* latent_cache_ptr,
+    // int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int64_t const* cu_kv_seq_lens, int const max_input_uncached_seq_len,
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, float const* kv_scale_orig_quant_ptr)
 {
@@ -790,6 +791,9 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
     int64_t const global_token_offset = cu_seq_lens[batch_idx] - cu_ctx_cached_kv_lens[batch_idx];
     int64_t const cached_kv_len = cu_ctx_cached_kv_lens[batch_idx + 1] - cu_ctx_cached_kv_lens[batch_idx];
     int64_t const uncached_kv_len = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx] - cached_kv_len;
+    // int64_t const uncached_kv_len = cu_kv_seq_lens
+    //     ? (cu_kv_seq_lens[batch_idx + 1] - cu_kv_seq_lens[batch_idx] - cached_kv_len)
+    //     : (cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx] - cached_kv_len);
 
     if (head_idx <= head_num)
     {
@@ -985,6 +989,7 @@ void invokeMLASetPagedKV(T* output, T const* k_ptr, T const* v_ptr, T const* k_p
 
 template <typename T, typename TCache>
 void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* latent_cache_ptr, int const num_requests,
+    // int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int64_t const* cu_kv_seq_lens, int const max_input_uncached_seq_len,
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
@@ -993,6 +998,7 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     TLLM_CHECK_WITH_INFO(lora_size == 512, "lora_size should be equal to %d", 512);
     TLLM_CHECK_WITH_INFO(rope_size == 64, "rope_size should be equal to %d", 64);
     applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+        // latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, cu_kv_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
         latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
         nope_size, kv_scale_orig_quant_ptr);
 }
@@ -1020,6 +1026,7 @@ INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
         int64_t const* cu_seq_lens, int const max_input_uncached_seq_len, float2 const* cos_sin_cache,                 \
         size_t head_num, int nope_size, int rope_size, int lora_size, float const* kv_scale_orig_quant_ptr,            \
         cudaStream_t stream);
+        // int64_t const* cu_seq_lens, int64_t const* cu_kv_seq_lens, int const max_input_uncached_seq_len, float2 const* cos_sin_cache,                 \
 
 INSTANTIATE_RW_KVCACHE_MLA(float, float);
 INSTANTIATE_RW_KVCACHE_MLA(float, __nv_fp8_e4m3);
