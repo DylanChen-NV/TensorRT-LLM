@@ -495,6 +495,7 @@ class MLA(nn.Module):
         self.mapping = mapping
 
         assert self.num_heads % tp_size == 0
+        self.global_num_heads = self.num_heads
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
@@ -621,10 +622,15 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
+        num_heads_gen = self.num_heads
+        global FLASH_DECODING
+        if FLASH_DECODING == "1":
+            num_heads_gen = self.global_num_heads
+        print(f"czq target3 {num_heads_gen}")
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
-            self.num_heads,
+            num_heads_gen,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             num_kv_heads=1,
             pos_embd_params=pos_embd_params,
@@ -1342,7 +1348,7 @@ class MLA(nn.Module):
         # A. 更新 q_pe，并全存kv
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q_flash_decoding(
-            q, latent_cache, attn_metadata)
+            q, latent_cache, attn_metadata, self.tp_size)
 
         # bs > 1 时会读成别的seq的kv，待排查
         # 先默认bs==1
@@ -1396,11 +1402,8 @@ class MLA(nn.Module):
 
         # TODO:
         # v1[done]: 单卡，走通外置kv处理；在不切割kv对齐输出(可能需要打印原版kv看下)
-        # v2: 裸切割kv，实现reduce，对齐输出
+        # v2: 裸切割kv，实现reduce，对齐输出(先allgather+split，再all2all)
         # v3: 参考mla_rope_append_paged_kv_assign_q_flash_decoding实现切割+只在一个rank写kv
-
-        if czq_idx % 30 == 1:
-            import pdb;pdb.set_trace()
 
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
@@ -1450,14 +1453,16 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
 
-        if czq_idx % 30 == 1:
-            import pdb;pdb.set_trace()
-
         from ..distributed import allgather
         gathered_fused_q = allgather(fused_q, self.mapping, dim=1)
 
-        print(f"czq fused_q: {fused_q.shape} \n {fused_q[:, :32]}")
-        torch.cuda.synchronize()
+        # print(f"czq fused_q: {fused_q.shape} \n {fused_q[:, :32]}")
+
+        partial_softmax_stats_tensor = torch.empty(
+            (num_tokens, self.global_num_heads, 2),
+            dtype=torch.float,
+            device='cuda',
+        )
         attn_out_latent = self.mqa.forward(
             gathered_fused_q.view(num_tokens, -1),
             None,
@@ -1469,11 +1474,54 @@ class MLA(nn.Module):
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             mla_context_paged_kv=paged_full_kv,
             mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
-            # softmax_stats_tensor=self.temp_softmax_stats_tensor,
+            softmax_stats_tensor=partial_softmax_stats_tensor,
         )
-        torch.cuda.synchronize()
-        # print(f"czq attn_out_latent: {attn_out_latent.shape} \n {attn_out_latent[:, :512].sum(dim=1)}")
-        print(f"czq attn_out_latent: {attn_out_latent.shape} \n {attn_out_latent[:, :32]}")
+
+        if czq_idx % 30 == 1:
+            import pdb;pdb.set_trace()
+        
+        # 先allgather,之后改all2all
+        if self.tp_size > 0:
+            partial_attn_out_latent = attn_out_latent
+            gathered_attn_out_latent = allgather(
+                partial_attn_out_latent.view(1, *partial_attn_out_latent.shape),
+                self.mapping,
+                dim=0
+            )
+            head_start = self.num_heads * self.tp_rank
+            head_end = head_start + self.num_heads
+            gathered_attn_out_latent = gathered_attn_out_latent.view(self.tp_size, num_tokens, self.global_num_heads, self.kv_lora_rank)
+            gathered_attn_out_latent = gathered_attn_out_latent[:, :, head_start: head_end, :]
+            gathered_attn_out_latent = gathered_attn_out_latent.view(self.tp_size, num_tokens, -1)
+            gathered_partial_softmax_stats_tensor = allgather(
+                partial_softmax_stats_tensor.view(1, *partial_softmax_stats_tensor.shape),
+                self.mapping,
+                dim=0
+            )
+            gathered_partial_softmax_stats_tensor = gathered_partial_softmax_stats_tensor[:, :, head_start: head_end, :]
+
+            attn_out_latent = gathered_attn_out_latent[0]
+            reduced_softmax_stats_tensor = torch.empty_like(partial_softmax_stats_tensor)
+            # 结果不对，和gt对一下
+            merge_op = torch.ones(
+                [num_tokens],
+                dtype=torch.int64,
+                device=q.device,
+            )
+            for i in range(1, self.tp_size):
+                # print("czq attn_out_latent", attn_out_latent)
+                # print("czq gathered_attn_out_latent", gathered_attn_out_latent[i])
+                # print("czq reduced_softmax_stats_tensor", reduced_softmax_stats_tensor)
+                # print("czq gathered_partial_softmax_stats_tensor", gathered_partial_softmax_stats_tensor[i])
+                trtllm_attention.merge_attention_for_mla_flash_decoding(attn_out_latent, gathered_attn_out_latent[i],
+                                                         reduced_softmax_stats_tensor,
+                                                         gathered_partial_softmax_stats_tensor[i],
+                                                         merge_op, attn_metadata, self.num_heads)
+
+        if czq_idx % 30 == 1:
+            import pdb;pdb.set_trace()
+
+        # print(f"czq attn_out_latent: {attn_out_latent.shape} \n {attn_out_latent[:, :32]}")
         fused_q = None
 
         assert (attn_out_latent.shape[0] == q.shape[0] and

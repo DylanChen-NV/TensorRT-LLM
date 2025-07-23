@@ -1246,6 +1246,7 @@ int AttentionOp::mlaGeneration(
             tllmRunnerParams.scaleSoftmaxLog2Ptr
                 = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
         }
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(generation_params.softmaxStatsPtr);
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);

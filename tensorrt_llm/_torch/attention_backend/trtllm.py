@@ -1567,6 +1567,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
+        tp_size: int,
     ) -> None:
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
@@ -1598,7 +1599,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # None, # to be removed
             max_gen_seq_len,
             self.wrapper.rotary_cos_sin,
-            self.num_heads,
+            self.num_heads // tp_size,
             self.mla_params.qk_nope_head_dim,
             self.mla_params.qk_rope_head_dim,
             self.mla_params.kv_lora_rank,
@@ -1653,6 +1654,38 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sink_token_length,
             beam_width,
             self.wrapper.quant_mode,
+        )
+
+    def merge_attention_for_mla_flash_decoding(
+        self,
+        merged_attn: torch.Tensor,
+        temp_attn: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        temp_softmax_stats: torch.Tensor,
+        merge_op: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        num_heads: int,
+    ) -> None:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+
+        cu_q_seq_len = torch.cumsum(
+            torch.tensor([0] + [1] * metadata.num_generations,
+                         dtype=torch.int64, device=temp_attn.device),
+            dim=0
+            )
+
+        torch.ops.trtllm.merge_chunked_attention_for_mla(
+            merged_attn,
+            temp_attn,
+            softmax_stats,
+            temp_softmax_stats,
+            metadata.num_generations,
+            cu_q_seq_len,  # cu_q_seq_len
+            1,  # max_q_seq_len
+            merge_op,
+            num_heads,
+            self.mla_params.kv_lora_rank,
         )
 
     def merge_attention_for_mla(

@@ -340,6 +340,11 @@ public:
             enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
             enqueue_params.start_token_idx_sf = token_offset;
 
+            if (softmax_stats_tensor.has_value())
+            {
+                enqueue_params.softmaxStatsPtr = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
+            }
+
             if (op.isMRoPE() && mrope_position_deltas.has_value())
             {
                 enqueue_params.mrope_position_deltas = mrope_position_deltas.value().data_ptr<int32_t>();
