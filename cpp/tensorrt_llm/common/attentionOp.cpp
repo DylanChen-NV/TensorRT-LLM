@@ -917,11 +917,30 @@ int AttentionOp::mlaGeneration(
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     params.cache_type = (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
-    auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
-        sizePerToken, generation_params.cyclic_attention_window_size,
-        generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
-        generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
-        generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
+    KVBlockArray kv_cache_buffer;
+    char const* flash_decoding = std::getenv("FLASH_DECODING");
+    if (!flash_decoding || std::string(flash_decoding) == "0")
+    {
+        // auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
+        kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
+            sizePerToken, generation_params.cyclic_attention_window_size,
+            generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
+            generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
+            generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(
+            params.context_paged_kv_ptr != nullptr, "Paged kv cache is not set for MLA context kernel");
+        TLLM_CHECK_WITH_INFO(params.context_kv_cache_block_offsets_ptr != nullptr,
+            "Paged kv cache block offsets is not set for MLA context kernel");
+        // build another KVBlockArray for MLA context kernel to read paged kv cache
+        kv_cache_buffer = KVBlockArray(batch_beam, params.context_paged_kv_max_blocks_per_seq, mTokensPerBlock,
+            sizePerToken, generation_params.cyclic_attention_window_size,
+            generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
+            generation_params.can_use_one_more_block, params.context_paged_kv_ptr, nullptr,
+            static_cast<KVBlockArray::DataType*>(params.context_kv_cache_block_offsets_ptr));
+    }
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
@@ -961,9 +980,11 @@ int AttentionOp::mlaGeneration(
     params.host_bmm1_scale
         = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
 
-    invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
-    sync_check_cuda_error(stream);
-
+    if (!flash_decoding || std::string(flash_decoding) == "0")
+    {
+        invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
+        sync_check_cuda_error(stream);
+    }
     if (generation_params.runtime_perf_knobs)
     {
         int64_t multi_block_mode_val = generation_params.runtime_perf_knobs[0];
@@ -1055,6 +1076,7 @@ int AttentionOp::mlaGeneration(
             tllmRunnerParams.scaleSoftmaxLog2Ptr
                 = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
         }
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(generation_params.softmaxStatsPtr);
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);

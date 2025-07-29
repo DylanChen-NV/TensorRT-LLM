@@ -206,6 +206,9 @@ public:
         int32_t spec_decoding_max_generation_length = 1;
         // optional when fuse_fp4_quant is enabled
         int32_t start_token_idx_sf = 0;
+
+        // For MLA flash decoding
+        void* softmaxStatsPtr = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>

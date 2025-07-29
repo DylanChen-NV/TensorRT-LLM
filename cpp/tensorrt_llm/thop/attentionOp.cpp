@@ -170,6 +170,17 @@ public:
                 // assume latent_cache has been written to paged kv cache by the PyTorch backend
                 TORCH_CHECK(latent_cache.has_value());
                 mla_params.latent_cache = static_cast<T const*>(latent_cache->data_ptr());
+
+                if (mla_context_paged_kv.has_value())
+                {
+                    // TODO: variable name to be modified
+                    mla_params.context_paged_kv_ptr = mla_context_paged_kv->data_ptr();
+                }
+                if (mla_context_kv_cache_block_offsets.has_value())
+                {
+                    mla_params.context_kv_cache_block_offsets_ptr = mla_context_kv_cache_block_offsets->data_ptr();
+                    mla_params.context_paged_kv_max_blocks_per_seq = mla_context_kv_cache_block_offsets->size(-1);
+                }
             }
             if (!is_context)
             {
@@ -319,6 +330,11 @@ public:
             enqueue_params.semaphores = op.multiBlockSemaphores();
             enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
             enqueue_params.start_token_idx_sf = token_offset;
+
+            if (softmax_stats_tensor.has_value())
+            {
+                enqueue_params.softmaxStatsPtr = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
+            }
 
             if (op.isMRoPE() && mrope_position_deltas.has_value())
             {
