@@ -28,7 +28,9 @@ namespace
 template <typename T>
 struct MergeSoftmaxTraits
 {
-    static constexpr int kQKNopeSize = 128;
+    // TODO:
+    // static constexpr int kQKNopeSize = 128;
+    static constexpr int kQKNopeSize = 512;
     static constexpr int kHeadSize = kQKNopeSize;
 
     static constexpr int kBytesPerElem = sizeof(T);
@@ -75,9 +77,11 @@ template <typename T>
 struct setChunkedKVKernelTraits
 {
     using VecT = uint4;
-    static constexpr int kQKNopeSize = 128;
-    static constexpr int kVHeadSize = 128;
-    static_assert(kQKNopeSize == kVHeadSize);
+    // TODO: refine
+    // static constexpr int kQKNopeSize = 128;
+    static constexpr int kQKNopeSize = 512;
+    // static constexpr int kVHeadSize = 128;
+    // static_assert(kQKNopeSize == kVHeadSize);
     static constexpr int kRopeSize = 64;
     static constexpr int kHeadSize = kQKNopeSize + kRopeSize;
     static constexpr int kBytesPerElem = sizeof(T);
@@ -87,7 +91,8 @@ struct setChunkedKVKernelTraits
         "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
     static constexpr int kThreadPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
     static constexpr int kKVThreadPerHead = (kQKNopeSize * kBytesPerElem) / kBytesPerLoad;
-    static constexpr int kCpTokenPerBlock = 16;
+    // static constexpr int kCpTokenPerBlock = 16;
+    static constexpr int kCpTokenPerBlock = 4;
     static constexpr int kBlockSize = kThreadPerHead * kCpTokenPerBlock;
 };
 
