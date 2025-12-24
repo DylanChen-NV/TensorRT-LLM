@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch._dynamo.config
+import torch.nn.functional as F
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
@@ -516,7 +517,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type is not None:
+        if cp_type is not None and not self.mapping.has_cp_ulysses():
             logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
                         cp_type.name)
             return
@@ -2245,6 +2246,31 @@ class PyTorchModelEngine(ModelEngine):
 
         return lora_params
 
+    def _prepare_ulysses_context_parallel_inputs(
+            self, inputs: Dict[str, Any], gather_ids: Optional[torch.Tensor]):
+        """
+            input_ids: [c0, ctx1, ..., ctxn, gen0, gen1, ..., genm]
+        """
+        # TODO 加文档，全切，建议用PD分离仅P使用
+        input_ids = inputs["input_ids"]
+        inputs["position_ids"]
+        attn_metadata = inputs["attn_metadata"]
+
+        total_seq_len = input_ids.shape[0]
+        cp_size = attn_metadata.mapping.cp_size
+        cp_rank = attn_metadata.mapping.cp_rank
+        cp_chunk_size = (total_seq_len + cp_size - 1) // cp_size
+        left = cp_chunk_size * cp_rank
+        right = left + cp_chunk_size
+        padding = max(0, right - max(left, total_seq_len))
+        right = min(total_seq_len, right)
+
+        inputs["input_ids"] = input_ids[left:right]
+        if padding > 0:
+            inputs["input_ids"] = F.pad(inputs["input_ids"], (0, padding),
+                                        "constant", 0)
+        return inputs, gather_ids
+
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
             self,
@@ -2256,20 +2282,25 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
-            if CpType.STAR == cp_type:
+            if cp_type == CpType.STAR:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
-            elif CpType.HELIX == cp_type:
+            elif cp_type in [CpType.HELIX, CpType.ULYSSES]:
                 # Take the usual route of _prepare_tp_inputs.
                 pass
             else:
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                       attn_metadata, spec_metadata,
-                                       new_tensors_device,
-                                       cache_indirection_buffer)
+        inputs, gather_ids = self._prepare_tp_inputs(
+            scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
+            new_tensors_device, cache_indirection_buffer)
+
+        if self.mapping is not None and self.mapping.has_cp_ulysses():
+            inputs, gather_ids = self._prepare_ulysses_context_parallel_inputs(
+                inputs, gather_ids)
+
+        return inputs, gather_ids
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
