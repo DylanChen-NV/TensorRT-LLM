@@ -909,13 +909,13 @@ def main(*,
         with (build_dir / "tensorrt_llm" / "flash_mla" /
               "cuda_architectures.txt").open() as f:
             flash_mla_cuda_architectures = f.read().strip().strip(";")
-        if flash_mla_cuda_architectures:
-            install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
-                         pkg_dir)
-            install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                         "flash_mla",
-                         pkg_dir / "flash_mla",
-                         dirs_exist_ok=True)
+        #if flash_mla_cuda_architectures:
+        #    install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
+        #                 pkg_dir)
+        #    install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
+        #                 "flash_mla",
+        #                 pkg_dir / "flash_mla",
+        #                 dirs_exist_ok=True)
 
         if not skip_stubs:
             with working_directory(pkg_dir):

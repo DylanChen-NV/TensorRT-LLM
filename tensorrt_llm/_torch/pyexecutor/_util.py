@@ -799,8 +799,11 @@ def create_py_executor_instance(
     mapping_for_kv_cache_transceiver = mapping
     if mapping.has_cp_ulysses():
         mapping_for_kv_cache_transceiver = copy.deepcopy(mapping)
+        mapping_for_kv_cache_transceiver.moe_tp_cluster_ep_size = mapping.moe_tp_cluster_ep_size * mapping.cp_size
+        mapping_for_kv_cache_transceiver.moe_tp_size = mapping.moe_tp_size * mapping.cp_size
         mapping_for_kv_cache_transceiver.tp_size = mapping.tp_size * mapping.cp_size
         mapping_for_kv_cache_transceiver.cp_size = 1
+        mapping_for_kv_cache_transceiver._init_parallel_groups()
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping_for_kv_cache_transceiver, dist, kv_cache_manager,
         attention_type, cache_transceiver_config)

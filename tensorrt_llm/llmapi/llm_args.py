@@ -22,6 +22,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.mapping import CpType
 
 from .._utils import mpi_rank
 
@@ -2940,6 +2941,9 @@ def update_llm_args_with_extra_dict(
                     **llm_args_dict[field_name])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
+
+    if llm_args_dict.get("context_parallel_size", 1) > 1:
+        llm_args_dict["cp_config"] = {"cp_type": CpType.ULYSSES}
 
     llm_args = llm_args | llm_args_dict
 
